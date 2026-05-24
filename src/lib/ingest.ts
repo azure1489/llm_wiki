@@ -6,6 +6,11 @@ import { useChatStore } from "@/stores/chat-store"
 import { useActivityStore } from "@/stores/activity-store"
 import { useReviewStore, type ReviewItem } from "@/stores/review-store"
 import { getFileName, normalizePath } from "@/lib/path-utils"
+import {
+  sourceIdentityForPath,
+  sourceSummarySlugFromIdentity,
+} from "@/lib/source-identity"
+import { parseSources, writeSources } from "@/lib/sources-merge"
 import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import { sanitizeIngestedFileContent } from "@/lib/ingest-sanitize"
 import { mergePageContent, type MergeFn } from "@/lib/page-merge"
@@ -307,6 +312,9 @@ async function autoIngestImpl(
   const sp = normalizePath(sourcePath)
   const activity = useActivityStore.getState()
   const fileName = getFileName(sp)
+  const sourceIdentity = sourceIdentityForPath(pp, sp)
+  const sourceSummarySlug = sourceSummarySlugFromIdentity(sourceIdentity)
+  const sourceSummaryPath = `wiki/sources/${sourceSummarySlug}.md`
   console.log(`[ingest:diag] autoIngestImpl ENTRY for "${fileName}" (project="${pp}", source="${sp}")`)
   const activityId = activity.addItem({
     type: "ingest",
@@ -334,12 +342,12 @@ async function autoIngestImpl(
   // re-running them costs only the extraction time and converges the
   // source-summary page on the current pipeline's contract regardless
   // of when the file was first ingested.
-  const cachedFiles = await checkIngestCache(pp, fileName, sourceContent)
-  console.log(`[ingest:diag] cache check for "${fileName}":`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
+  const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent)
+  console.log(`[ingest:diag] cache check for "${sourceIdentity}":`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
   if (cachedFiles !== null) {
     try {
       console.log(`[ingest:diag] cache-hit branch: starting image extraction for ${sp}`)
-      const savedImages = await extractAndSaveSourceImages(pp, sp)
+      const savedImages = await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
       console.log(`[ingest:diag] cache-hit branch: got ${savedImages.length} image(s)`)
       if (savedImages.length > 0) {
         // Caption first (populates the cache), THEN inject — the
@@ -370,7 +378,7 @@ async function autoIngestImpl(
               await captionMarkdownImages(pp, sourceContent, captionLlm, {
                 signal,
                 shouldCaption: (url) =>
-                  url.startsWith(`${pp}/wiki/media/${fileName.replace(/\.[^.]+$/, "")}/`),
+                  url.startsWith(`${pp}/wiki/media/${sourceSummarySlug}/`),
                 urlToAbsPath: (url) => url,
                 concurrency: mmCfg.concurrency,
                 onProgress: (done, total) =>
@@ -385,14 +393,14 @@ async function autoIngestImpl(
               )
             }
           }
-          await injectImagesIntoSourceSummary(pp, fileName, savedImages)
+          await injectImagesIntoSourceSummary(pp, sourceIdentity, sourceSummarySlug, savedImages)
           // Re-embed the source-summary page so caption text lands
           // in the search index. Without this step, search by image
           // content stays empty for files ingested before captioning
           // was added — the safety-net section was just rewritten
           // with captions, but the embeddings still reflect the old
           // empty-alt content.
-          await reembedSourceSummary(pp, fileName)
+          await reembedSourceSummary(pp, sourceIdentity, sourceSummarySlug)
         }
       } else {
         console.log(`[ingest:diag] cache-hit branch: skipping injection (no images returned from extraction)`)
@@ -430,11 +438,11 @@ async function autoIngestImpl(
   // and returns [] on any error.
   activity.updateItem(activityId, { detail: "Extracting embedded images..." })
   console.log(`[ingest:diag] full-pipeline branch: starting image extraction for ${sp}`)
-  const savedImages = await extractAndSaveSourceImages(pp, sp)
+  const savedImages = await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
   console.log(`[ingest:diag] full-pipeline branch: got ${savedImages.length} image(s)`)
   if (savedImages.length > 0) {
     console.log(
-      `[ingest:images] saved ${savedImages.length} image(s) for "${fileName}" → wiki/media/${fileName.replace(/\.[^.]+$/, "")}/`,
+      `[ingest:images] saved ${savedImages.length} image(s) for "${sourceIdentity}" → wiki/media/${sourceSummarySlug}/`,
     )
   }
 
@@ -497,8 +505,7 @@ async function autoIngestImpl(
     /!\[\]\(/.test(sourceContent)
   ) {
     activity.updateItem(activityId, { detail: "Captioning images..." })
-    const sourceSlug = fileName.replace(/\.[^.]+$/, "")
-    const ourMediaPrefix = `${pp}/wiki/media/${sourceSlug}/`
+    const ourMediaPrefix = `${pp}/wiki/media/${sourceSummarySlug}/`
     try {
       const result = await captionMarkdownImages(pp, sourceContent, captionLlm, {
         signal,
@@ -544,7 +551,7 @@ async function autoIngestImpl(
     llmConfig,
     [
       { role: "system", content: buildAnalysisPrompt(purpose, index, truncatedContent) },
-      { role: "user", content: `Analyze this source document:\n\n**File:** ${fileName}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${truncatedContent}` },
+      { role: "user", content: `Analyze this source document:\n\n**File:** ${sourceIdentity}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${truncatedContent}` },
     ],
     {
       onToken: (token) => { analysis += token },
@@ -574,11 +581,11 @@ async function autoIngestImpl(
   await streamChat(
     llmConfig,
     [
-      { role: "system", content: buildGenerationPrompt(schema, purpose, index, fileName, overview, truncatedContent) },
+      { role: "system", content: buildGenerationPrompt(schema, purpose, index, sourceIdentity, overview, truncatedContent, sourceSummaryPath) },
       {
         role: "user",
         content: [
-          `Source document to process: **${fileName}**`,
+          `Source document to process: **${sourceIdentity}**`,
           "",
           "The Stage 1 analysis below is CONTEXT to inform your output. Do NOT echo",
           "its tables, bullet points, or prose. Your output must be FILE/REVIEW",
@@ -594,7 +601,7 @@ async function autoIngestImpl(
           "",
           "---",
           "",
-          `Now emit the FILE blocks for the wiki files derived from **${fileName}**.`,
+          `Now emit the FILE blocks for the wiki files derived from **${sourceIdentity}**.`,
           "Your response MUST begin with `---FILE:` as the very first characters.",
           "No preamble. No analysis prose. Start immediately.",
         ].join("\n"),
@@ -622,7 +629,8 @@ async function autoIngestImpl(
     pp,
     generation,
     llmConfig,
-    fileName,
+    sourceIdentity,
+    sourceSummaryPath,
     signal,
   )
 
@@ -638,10 +646,8 @@ async function autoIngestImpl(
   }
 
   // Ensure source summary page exists (LLM may not have generated it correctly)
-  const sourceBaseName = fileName.replace(/\.[^.]+$/, "")
-  const sourceSummaryPath = `wiki/sources/${sourceBaseName}.md`
   const sourceSummaryFullPath = `${pp}/${sourceSummaryPath}`
-  const hasSourceSummary = writtenPaths.some((p) => p.startsWith("wiki/sources/"))
+  const hasSourceSummary = writtenPaths.some((p) => normalizePath(p) === sourceSummaryPath)
 
   // If the signal was aborted (e.g. user switched projects / cancelled),
   // skip the fallback summary write — the LLM streams returned empty
@@ -654,15 +660,15 @@ async function autoIngestImpl(
     const fallbackContent = [
       "---",
       `type: source`,
-      `title: "Source: ${fileName}"`,
+      `title: "Source: ${sourceIdentity}"`,
       `created: ${date}`,
       `updated: ${date}`,
-      `sources: ["${fileName}"]`,
+      `sources: ["${sourceIdentity}"]`,
       `tags: []`,
       `related: []`,
       "---",
       "",
-      `# Source: ${fileName}`,
+      `# Source: ${sourceIdentity}`,
       "",
       analysis ? analysis.slice(0, 3000) : "(Analysis not available)",
       "",
@@ -681,7 +687,7 @@ async function autoIngestImpl(
   // want the safety-net section to slip image refs into the wiki
   // through the back door.
   if (mmCfg.enabled && savedImages.length > 0 && !signal?.aborted) {
-    await injectImagesIntoSourceSummary(pp, fileName, savedImages)
+    await injectImagesIntoSourceSummary(pp, sourceIdentity, sourceSummarySlug, savedImages)
   }
 
   if (writtenPaths.length > 0) {
@@ -710,10 +716,10 @@ async function autoIngestImpl(
   // — they represent deterministic decisions and caching them is
   // safe.
   if (writtenPaths.length > 0 && hardFailures.length === 0) {
-    await saveIngestCache(pp, fileName, sourceContent, writtenPaths)
+    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths)
   } else if (hardFailures.length > 0) {
     console.warn(
-      `[ingest] Skipping cache save for "${fileName}" — ${hardFailures.length} block(s) failed to write: ${hardFailures.join(", ")}`,
+      `[ingest] Skipping cache save for "${sourceIdentity}" — ${hardFailures.length} block(s) failed to write: ${hardFailures.join(", ")}`,
     )
   }
 
@@ -786,11 +792,53 @@ function contentMatchesTargetLanguage(content: string, target: string): boolean 
   return !detectedIsCjk
 }
 
+function isLogPath(relativePath: string): boolean {
+  return relativePath === "wiki/log.md" || relativePath.endsWith("/log.md")
+}
+
+function isListingPath(relativePath: string): boolean {
+  return (
+    relativePath === "wiki/index.md" ||
+    relativePath.endsWith("/index.md") ||
+    relativePath === "wiki/overview.md" ||
+    relativePath.endsWith("/overview.md")
+  )
+}
+
+function canonicalizeSourcesField(content: string, sourceIdentity: string): string {
+  if (!/^---\n/.test(content)) return content
+
+  const identityKey = normalizePath(sourceIdentity).toLowerCase()
+  const identityBaseName = getFileName(sourceIdentity).toLowerCase()
+  const sourceValues = parseSources(content)
+  const canonicalValues = sourceValues.map((source) => {
+    const normalized = normalizePath(source)
+    const key = normalized.toLowerCase()
+    if (key === identityKey) return sourceIdentity
+    if (!normalized.includes("/") && key === identityBaseName) return sourceIdentity
+    return source
+  })
+  if (!canonicalValues.some((source) => normalizePath(source).toLowerCase() === identityKey)) {
+    canonicalValues.push(sourceIdentity)
+  }
+
+  const seen = new Set<string>()
+  const deduped = canonicalValues.filter((source) => {
+    const key = normalizePath(source).toLowerCase()
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+
+  return writeSources(content, deduped)
+}
+
 async function writeFileBlocks(
   projectPath: string,
   text: string,
   llmConfig: LlmConfig,
   sourceFileName: string,
+  sourceSummaryPath?: string,
   signal?: AbortSignal,
 ): Promise<{ writtenPaths: string[]; warnings: string[]; hardFailures: string[] }> {
   const { blocks, warnings: parseWarnings } = parseFileBlocks(text)
@@ -808,7 +856,12 @@ async function writeFileBlocks(
 
   const targetLang = useWikiStore.getState().outputLanguage
 
-  for (const { path: relativePath, content: rawContent } of blocks) {
+  for (const { path: rawRelativePath, content: rawContent } of blocks) {
+    let relativePath = rawRelativePath
+    if (sourceSummaryPath && relativePath.startsWith("wiki/sources/")) {
+      relativePath = sourceSummaryPath
+    }
+
     // Sanitize at the boundary — strip stray code-fence wrappers,
     // `frontmatter:` prefixes, and repair invalid wikilink-list
     // YAML lines so the file we write is canonical regardless of
@@ -817,7 +870,10 @@ async function writeFileBlocks(
     // step ~45% of generated entity pages went to disk with
     // unparseable frontmatter and the read-time fallback had to
     // paper over it forever.
-    const content = sanitizeIngestedFileContent(rawContent)
+    let content = sanitizeIngestedFileContent(rawContent)
+    if (!isLogPath(relativePath) && !isListingPath(relativePath)) {
+      content = canonicalizeSourcesField(content, sourceFileName)
+    }
 
     // Language guard: reject individual FILE blocks whose body contradicts
     // the user-set target language. Skip:
@@ -827,8 +883,7 @@ async function writeFileBlocks(
     //   quotes Russian philosophers) which confuses naive script-based
     //   detection. Keep the check for /concepts/ pages, which should be
     //   authoritative content in the target language.
-    const isLog =
-      relativePath.endsWith("/log.md") || relativePath === "wiki/log.md"
+    const isLog = isLogPath(relativePath)
     const isEntityOrSource =
       relativePath.startsWith("wiki/entities/") ||
       relativePath.includes("/entities/") ||
@@ -849,15 +904,12 @@ async function writeFileBlocks(
 
     const fullPath = `${projectPath}/${relativePath}`
     try {
-      if (relativePath === "wiki/log.md" || relativePath.endsWith("/log.md")) {
+      if (isLogPath(relativePath)) {
         const existing = await tryReadFile(fullPath)
         const appended = existing ? `${existing}\n\n${content.trim()}` : content.trim()
         await writeFile(fullPath, appended)
       } else if (
-        relativePath === "wiki/index.md" ||
-        relativePath.endsWith("/index.md") ||
-        relativePath === "wiki/overview.md" ||
-        relativePath.endsWith("/overview.md")
+        isListingPath(relativePath)
       ) {
         // Listing pages (index / overview) are always overwritten
         // wholesale — their sources field is incidental and merging
@@ -1026,9 +1078,18 @@ export function buildAnalysisPrompt(purpose: string, index: string, sourceConten
 /**
  * Step 2 prompt: AI takes its own analysis and generates wiki files + review items.
  */
-export function buildGenerationPrompt(schema: string, purpose: string, index: string, sourceFileName: string, overview?: string, sourceContent: string = ""): string {
+export function buildGenerationPrompt(
+  schema: string,
+  purpose: string,
+  index: string,
+  sourceFileName: string,
+  overview?: string,
+  sourceContent: string = "",
+  sourceSummaryPath?: string,
+): string {
   // Use original filename (without extension) as the source summary page name
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
+  const summaryPath = sourceSummaryPath ?? `wiki/sources/${sourceBaseName}.md`
 
   return [
     "You are a wiki maintainer. Based on the analysis provided, generate wiki files.",
@@ -1042,7 +1103,7 @@ export function buildGenerationPrompt(schema: string, purpose: string, index: st
     "",
     "## What to generate",
     "",
-    `1. A source summary page at **wiki/sources/${sourceBaseName}.md** (MUST use this exact path)`,
+    `1. A source summary page at **${summaryPath}** (MUST use this exact path)`,
     "2. Entity pages in wiki/entities/ for key entities identified in the analysis",
     "3. Concept pages in wiki/concepts/ for key concepts identified in the analysis",
     "4. An updated wiki/index.md — add new entries to existing categories, preserve all existing entries",
@@ -1292,12 +1353,12 @@ async function backupExistingPage(
  */
 async function injectImagesIntoSourceSummary(
   pp: string,
-  fileName: string,
+  sourceIdentity: string,
+  sourceSummarySlug: string,
   savedImages: { relPath: string; page: number | null; sha256?: string }[],
 ): Promise<void> {
   if (savedImages.length === 0) return
-  const sourceBaseName = fileName.replace(/\.[^.]+$/, "")
-  const sourceSummaryPath = `wiki/sources/${sourceBaseName}.md`
+  const sourceSummaryPath = `wiki/sources/${sourceSummarySlug}.md`
   const sourceSummaryFullPath = `${pp}/${sourceSummaryPath}`
   console.log(`[ingest:diag] injectImagesIntoSourceSummary: target=${sourceSummaryFullPath}, images=${savedImages.length}`)
   try {
@@ -1331,15 +1392,15 @@ async function injectImagesIntoSourceSummary(
       const stubFrontmatter = [
         "---",
         "type: source",
-        `title: "Source: ${fileName}"`,
+        `title: "Source: ${sourceIdentity}"`,
         `created: ${date}`,
         `updated: ${date}`,
-        `sources: ["${fileName}"]`,
+        `sources: ["${sourceIdentity}"]`,
         "tags: []",
         "related: []",
         "---",
         "",
-        `# Source: ${fileName}`,
+        `# Source: ${sourceIdentity}`,
         "",
       ].join("\n")
       await writeFile(sourceSummaryFullPath, stubFrontmatter + wrapped)
@@ -1369,23 +1430,26 @@ async function injectImagesIntoSourceSummary(
  * already exist in the step-6 logic. Wrapping them once here
  * avoids drift between the two paths if either side changes.
  */
-async function reembedSourceSummary(pp: string, fileName: string): Promise<void> {
+async function reembedSourceSummary(
+  pp: string,
+  sourceIdentity: string,
+  sourceSummarySlug: string,
+): Promise<void> {
   const embCfg = useWikiStore.getState().embeddingConfig
   if (!embCfg.enabled || !embCfg.model) return
-  const sourceBaseName = fileName.replace(/\.[^.]+$/, "")
-  const sourceSummaryFullPath = `${pp}/wiki/sources/${sourceBaseName}.md`
+  const sourceSummaryFullPath = `${pp}/wiki/sources/${sourceSummarySlug}.md`
   try {
     const content = await readFile(sourceSummaryFullPath)
     const titleMatch = content.match(
       /^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m,
     )
-    const title = titleMatch ? titleMatch[1].trim() : sourceBaseName
+    const title = titleMatch ? titleMatch[1].trim() : sourceIdentity
     const { embedPage } = await import("@/lib/embedding")
-    await embedPage(pp, sourceBaseName, title, content, embCfg)
-    console.log(`[ingest:caption] re-embedded ${sourceBaseName} with captioned alt text`)
+    await embedPage(pp, sourceSummarySlug, title, content, embCfg)
+    console.log(`[ingest:caption] re-embedded ${sourceSummarySlug} with captioned alt text`)
   } catch (err) {
     console.warn(
-      `[ingest:caption] re-embed failed for ${sourceBaseName}:`,
+      `[ingest:caption] re-embed failed for ${sourceSummarySlug}:`,
       err instanceof Error ? err.message : err,
     )
   }
@@ -1399,6 +1463,8 @@ export async function startIngest(
 ): Promise<void> {
   const pp = normalizePath(projectPath)
   const sp = normalizePath(sourcePath)
+  const sourceIdentity = sourceIdentityForPath(pp, sp)
+  const sourceSummarySlug = sourceSummarySlugFromIdentity(sourceIdentity)
   const store = getStore()
   store.setMode("ingest")
   store.setIngestSource(sp)
@@ -1414,7 +1480,7 @@ export async function startIngest(
   // Failure-tolerant — `extractAndSaveSourceImages` returns [] on
   // any error and logs internally; we never want image extraction
   // to break the ingest chat flow.
-  void extractAndSaveSourceImages(pp, sp).catch((err) => {
+  void extractAndSaveSourceImages(pp, sp, sourceSummarySlug).catch((err) => {
     console.warn(
       `[startIngest:images] eager extraction failed for "${getFileName(sp)}":`,
       err instanceof Error ? err.message : err,
@@ -1427,8 +1493,6 @@ export async function startIngest(
     tryReadFile(`${pp}/wiki/purpose.md`),
     tryReadFile(`${pp}/wiki/index.md`),
   ])
-
-  const fileName = getFileName(sp)
 
   const systemPrompt = [
     "You are a knowledgeable assistant helping to build a wiki from source documents.",
@@ -1443,12 +1507,12 @@ export async function startIngest(
     .join("\n\n")
 
   const userMessage = [
-    `I'm ingesting the following source file into my wiki: **${fileName}**`,
+    `I'm ingesting the following source file into my wiki: **${sourceIdentity}**`,
     "",
     "Please read it carefully and present the key takeaways, important concepts, and information that would be valuable to capture in the wiki. Highlight anything that relates to the wiki's purpose and schema.",
     "",
     "---",
-    `**File: ${fileName}**`,
+    `**File: ${sourceIdentity}**`,
     "```",
     sourceContent || "(empty file)",
     "```",
@@ -1489,6 +1553,16 @@ export async function executeIngestWrites(
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
   const store = getStore()
+  const ingestSource = store.ingestSource
+  const activeSourceIdentity = ingestSource
+    ? sourceIdentityForPath(pp, ingestSource)
+    : null
+  const activeSourceSummarySlug = activeSourceIdentity
+    ? sourceSummarySlugFromIdentity(activeSourceIdentity)
+    : null
+  const activeSourceSummaryPath = activeSourceSummarySlug
+    ? `wiki/sources/${activeSourceSummarySlug}.md`
+    : null
 
   const [schema, index] = await Promise.all([
     tryReadFile(`${pp}/wiki/schema.md`),
@@ -1506,6 +1580,14 @@ export async function executeIngestWrites(
     "",
     schema ? `## Wiki Schema\n${schema}` : "",
     index ? `## Current Wiki Index\n${index}` : "",
+    activeSourceIdentity && activeSourceSummaryPath
+      ? [
+          `## Source File`,
+          `The original source file is: **${activeSourceIdentity}**`,
+          `If you generate a source summary page, it MUST use this exact path: **${activeSourceSummaryPath}**.`,
+          `Every page generated from this source MUST include "${activeSourceIdentity}" in its frontmatter \`sources\` field.`,
+        ].join("\n")
+      : "",
     "",
     "Output ONLY the file contents in this exact format for each file:",
     "```",
@@ -1567,15 +1649,29 @@ export async function executeIngestWrites(
   const matches = accumulated.matchAll(FILE_BLOCK_REGEX)
 
   for (const match of matches) {
-    const relativePath = match[1].trim()
-    const content = match[2]
+    let relativePath = match[1].trim()
+    let content = match[2]
 
     if (!relativePath) continue
+    if (
+      activeSourceSummaryPath &&
+      relativePath.startsWith("wiki/sources/")
+    ) {
+      relativePath = activeSourceSummaryPath
+    }
+
+    if (
+      activeSourceIdentity &&
+      !isLogPath(relativePath) &&
+      !isListingPath(relativePath)
+    ) {
+      content = canonicalizeSourcesField(content, activeSourceIdentity)
+    }
 
     const fullPath = `${pp}/${relativePath}`
 
     try {
-      if (relativePath === "wiki/log.md" || relativePath.endsWith("/log.md")) {
+      if (isLogPath(relativePath)) {
         const existing = await tryReadFile(fullPath)
         const appended = existing
           ? `${existing}\n\n${content.trim()}`
@@ -1612,7 +1708,6 @@ export async function executeIngestWrites(
   // parameter (the chat-panel "Save to Wiki" button only passes
   // projectPath). Skipped silently when there's no ingestSource
   // (e.g. user manually entered chat mode and called this).
-  const ingestSource = getStore().ingestSource
   // Master toggle gate — see autoIngestImpl Step 0.6 / 3.5 for
   // the full rationale. When captioning is disabled, we skip the
   // safety-net inject here too so the executeIngestWrites path
@@ -1620,10 +1715,11 @@ export async function executeIngestWrites(
   const mmCfgWrites = useWikiStore.getState().multimodalConfig
   if (ingestSource && mmCfgWrites.enabled) {
     try {
-      const savedImages = await extractAndSaveSourceImages(pp, ingestSource)
+      const sourceIdentity = sourceIdentityForPath(pp, ingestSource)
+      const sourceSummarySlug = sourceSummarySlugFromIdentity(sourceIdentity)
+      const savedImages = await extractAndSaveSourceImages(pp, ingestSource, sourceSummarySlug)
       if (savedImages.length > 0) {
-        const fileName = getFileName(ingestSource)
-        await injectImagesIntoSourceSummary(pp, fileName, savedImages)
+        await injectImagesIntoSourceSummary(pp, sourceIdentity, sourceSummarySlug, savedImages)
       }
     } catch (err) {
       console.warn(
