@@ -53,7 +53,28 @@ export const INGESTABLE_SOURCE_EXTENSIONS = new Set([
   "xml",
   "yaml",
   "yml",
+  // Standalone image files — ingested via Vision LLM captioning
+  "jpg",
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+  "bmp",
+  "tiff",
+  "tif",
+  "avif",
+  "heic",
+  "heif",
 ])
+
+export const IMAGE_SOURCE_EXTENSIONS = new Set([
+  "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "avif", "heic", "heif",
+])
+
+export function isImageSource(path: string): boolean {
+  const ext = path.split(".").pop()?.toLowerCase() ?? ""
+  return IMAGE_SOURCE_EXTENSIONS.has(ext)
+}
 
 export interface DeleteSourceResult {
   deletedWikiPaths: string[]

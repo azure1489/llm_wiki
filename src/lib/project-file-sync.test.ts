@@ -247,6 +247,7 @@ describe("project file sync", () => {
 
     expect(mocks.enqueueBatch).toHaveBeenCalledWith("A", [
       { sourcePath: "raw/sources/report.pdf", folderContext: "" },
+      { sourcePath: "raw/sources/image.png", folderContext: "" },
     ])
   })
 
