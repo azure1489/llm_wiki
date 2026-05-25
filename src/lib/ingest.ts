@@ -1,4 +1,4 @@
-import { createDirectory, deleteFile, fileExists, readFile, writeFile, listDirectory } from "@/commands/fs"
+import { copyFile, createDirectory, deleteFile, fileExists, readFile, readFileAsBase64, writeFile, listDirectory } from "@/commands/fs"
 import { streamChat } from "@/lib/llm-client"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -21,6 +21,8 @@ import {
   buildImageMarkdownSection,
 } from "@/lib/extract-source-images"
 import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pipeline"
+import { captionImage } from "@/lib/vision-caption"
+import { isImageSource } from "@/lib/source-lifecycle"
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import { GENERATION_WIKI_TYPES } from "@/lib/wiki-page-types"
 import { computeContextBudget } from "@/lib/context-budget"
@@ -373,13 +375,67 @@ async function autoIngestImpl(
     filesWritten: [],
   })
 
-  const [sourceContent, schema, purpose, index, overview] = await Promise.all([
-    tryReadFile(sp),
+  const isImage = isImageSource(sp)
+
+  const [rawSourceContent, schema, purpose, index, overview] = await Promise.all([
+    isImage ? Promise.resolve("") : tryReadFile(sp),
     tryReadFile(`${pp}/schema.md`),
     tryReadFile(`${pp}/purpose.md`),
     tryReadFile(`${pp}/wiki/index.md`),
     tryReadFile(`${pp}/wiki/overview.md`),
   ])
+
+  // ── Standalone image files: build sourceContent via Vision LLM ──
+  let sourceContent = rawSourceContent
+  if (isImage) {
+    const mmCfg = useWikiStore.getState().multimodalConfig
+    const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
+    if (!mmCfg.enabled || !captionLlm) {
+      activity.updateItem(activityId, {
+        status: "error",
+        detail: "Multimodal captioning must be enabled to ingest image files",
+      })
+      return []
+    }
+    activity.updateItem(activityId, { detail: "Describing image with Vision LLM..." })
+    try {
+      const { base64, mimeType } = await readFileAsBase64(sp)
+      const caption = await captionImage(base64, mimeType, captionLlm, signal, {
+        maxTokens: 4096,
+      })
+      // Copy the image to wiki/media/ so it can be referenced from wiki pages
+      const mediaDir = `${pp}/wiki/media/${sourceSummarySlug}`
+      const imgExt = fileName.split(".").pop()?.toLowerCase() ?? "png"
+      const mediaRelPath = `media/${sourceSummarySlug}/img-1.${imgExt}`
+      const mediaAbsPath = `${pp}/wiki/${mediaRelPath}`
+      try {
+        await createDirectory(mediaDir)
+        await copyFile(sp, mediaAbsPath)
+      } catch {
+        // Non-critical — image copy may fail, caption still usable
+      }
+      sourceContent = [
+        `# Image: ${fileName}`,
+        "",
+        `![${caption.replace(/[\r\n]+/g, " ").replace(/]/g, ")")}](${mediaRelPath})`,
+        "",
+        "## Image Description",
+        "",
+        caption,
+        "",
+        folderContext ? `## Folder Context\n\nThis image is from: ${folderContext}` : "",
+      ].filter(Boolean).join("\n")
+      console.log(
+        `[ingest:image] Vision LLM described "${fileName}" (${caption.length} chars)`,
+      )
+    } catch (err) {
+      activity.updateItem(activityId, {
+        status: "error",
+        detail: `Vision LLM failed: ${err instanceof Error ? err.message : String(err)}`,
+      })
+      return []
+    }
+  }
 
   // ── Cache check: skip re-ingest if source content hasn't changed ──
   //
@@ -469,30 +525,22 @@ async function autoIngestImpl(
   }
 
   // ── Step 0.5: Extract embedded images ─────────────────────────
-  // Pulls every embedded image out of PDF / PPTX / DOCX into
-  // `wiki/media/<source-slug>/`. We DON'T inject the markdown
-  // references into sourceContent here — without VLM captions
-  // (Phase 3a) the alt text is empty, which gives the LLM no
-  // semantic signal to preserve them. The LLM tends to silently
-  // strip empty-alt images when summarizing.
-  //
-  // Instead, the markdown section is appended to the source-summary
-  // page on disk AFTER writeFileBlocks (see Step 5b below). That
-  // guarantees images appear in `wiki/sources/<slug>.md` regardless
-  // of LLM behavior. Once Phase 3a lands, we'll re-introduce the
-  // sourceContent injection because the captioned alt-text gives
-  // the LLM something meaningful to work with.
-  //
-  // Failure here is never fatal — extractAndSaveSourceImages logs
-  // and returns [] on any error.
-  activity.updateItem(activityId, { detail: "Extracting embedded images..." })
-  console.log(`[ingest:diag] full-pipeline branch: starting image extraction for ${sp}`)
-  const savedImages = await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
-  console.log(`[ingest:diag] full-pipeline branch: got ${savedImages.length} image(s)`)
-  if (savedImages.length > 0) {
-    console.log(
-      `[ingest:images] saved ${savedImages.length} image(s) for "${sourceIdentity}" → wiki/media/${sourceSummarySlug}/`,
-    )
+  // Standalone image files already have their content described and
+  // their image copied to wiki/media/ in the Vision LLM step above,
+  // so we skip extraction entirely for them.
+  let savedImages: Awaited<ReturnType<typeof extractAndSaveSourceImages>> = []
+  if (!isImage) {
+    activity.updateItem(activityId, { detail: "Extracting embedded images..." })
+    console.log(`[ingest:diag] full-pipeline branch: starting image extraction for ${sp}`)
+    savedImages = await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
+    console.log(`[ingest:diag] full-pipeline branch: got ${savedImages.length} image(s)`)
+    if (savedImages.length > 0) {
+      console.log(
+        `[ingest:images] saved ${savedImages.length} image(s) for "${sourceIdentity}" → wiki/media/${sourceSummarySlug}/`,
+      )
+    }
+  } else {
+    console.log(`[ingest:diag] standalone image — skipping embedded image extraction`)
   }
 
   // ── Step 0.6: Caption embedded images ─────────────────────────
@@ -534,10 +582,16 @@ async function autoIngestImpl(
   // (which renders read_file output directly) still shows them —
   // that surface is "the source document as-is", separate from
   // "the curated wiki knowledge".
+  // Standalone images already have enriched sourceContent from the
+  // Vision LLM step — skip the caption-markdown pipeline entirely.
   let enrichedSourceContent = sourceContent
   const mmCfg = useWikiStore.getState().multimodalConfig
   const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
-  if (!mmCfg.enabled && savedImages.length > 0) {
+  if (isImage) {
+    // sourceContent was already built from the Vision LLM caption —
+    // no further enrichment needed.
+    console.log(`[ingest:image] standalone image — skipping caption pipeline`)
+  } else if (!mmCfg.enabled && savedImages.length > 0) {
     // Strip `![alt](url)` references — match the same regex shape
     // we use elsewhere for image refs. Preserve a single space
     // where the ref used to sit so adjacent words don't fuse.
@@ -813,11 +867,10 @@ async function autoIngestImpl(
   }
 
   // ── Step 3.5: Append extracted images to the source-summary page ─
-  // Skipped when the master toggle is off — see Step 0.6 above for
-  // the full rationale. With captioning disabled we also don't
-  // want the safety-net section to slip image refs into the wiki
-  // through the back door.
-  if (mmCfg.enabled && savedImages.length > 0 && !signal?.aborted) {
+  // Skipped for standalone image files (their image reference is
+  // already part of the synthesized sourceContent) and when the
+  // master toggle is off.
+  if (!isImage && mmCfg.enabled && savedImages.length > 0 && !signal?.aborted) {
     await injectImagesIntoSourceSummary(pp, sourceIdentity, sourceSummarySlug, savedImages)
   }
 
