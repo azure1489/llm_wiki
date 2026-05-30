@@ -254,6 +254,9 @@ fn handle_request(
         (&Method::Get, ["projects", project_id, "files", "content"]) => {
             handle_file_content(app, project_id, query)
         }
+        (&Method::Get, ["projects", project_id, "agent", "page"]) => {
+            handle_agent_page(app, project_id, query)
+        }
         (&Method::Post, ["projects", project_id, "search"]) => handle_search(app, project_id, body),
         (&Method::Get, ["projects", project_id, "graph"]) => handle_graph(app, project_id, query),
         (&Method::Post, ["projects", project_id, "sources", "rescan"]) => {
@@ -372,6 +375,28 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Percent-encode one path segment with `encodeURIComponent` semantics:
+/// every byte outside the RFC 3986 unreserved set (`A-Z a-z 0-9 - _ . ~`)
+/// becomes `%XX`. Media paths are encoded segment-by-segment so the URL,
+/// once nginx percent-DECODES it, resolves back to the exact file on disk —
+/// whose directory names already carry literal `%`, spaces, and CJK bytes
+/// (the source slug is URL-encoded into the folder name at ingest time).
+/// `/` is never passed here; callers split on it first and rejoin with `/`.
+fn percent_encode_segment(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(input.len());
+    for &b in input.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 fn is_authorized(app: &AppHandle, query: &str, headers: &[(String, String)]) -> bool {
     if !api_auth_required(app) {
         return true;
@@ -452,6 +477,31 @@ fn api_allow_unauthenticated(app: &AppHandle) -> bool {
         .and_then(|v| v.get("allowUnauthenticated"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Public origin the agent reaches the media proxy through (the nginx/frp
+/// front door). Used to build directly-fetchable `images[].url` values in
+/// the agent page payload. Resolution order: `LLM_WIKI_PUBLIC_BASE_URL`
+/// env → `apiConfig.publicBaseUrl` in app-state → the deployed default.
+/// A trailing slash is trimmed so callers can `format!("{base}/{path}")`.
+fn api_public_base_url(app: &AppHandle) -> String {
+    let from_env = std::env::var("LLM_WIKI_PUBLIC_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let raw = from_env
+        .or_else(|| {
+            load_app_state(app).and_then(|parsed| {
+                parsed
+                    .get("apiConfig")
+                    .and_then(|v| v.get("publicBaseUrl"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+        })
+        .unwrap_or_else(|| "https://wiki.aworld.ltd".to_string());
+    raw.trim_end_matches('/').to_string()
 }
 
 /// Whether the API server should accept non-/health requests.
@@ -743,6 +793,209 @@ fn handle_file_content(app: &AppHandle, project_id: &str, query: &str) -> ApiRes
         })),
         Err(_) => err(415, "File is not valid UTF-8 text"),
     }
+}
+
+/// Agent-friendly page endpoint: returns a wiki/source page as structured JSON
+/// (parsed frontmatter + clean body + extracted image refs + wikilinks) so an
+/// agent doesn't have to parse markdown/YAML itself.
+fn handle_agent_page(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let params = parse_query(query);
+    let Some(rel) = params.get("path") else {
+        return err(400, "Missing path query parameter");
+    };
+    if !is_public_project_rel(rel) {
+        return err(403, "Path is not exposed by the local API");
+    }
+    if !is_text_content_rel(rel) {
+        return err(415, "Only text-like project files can be read via this endpoint");
+    }
+    let path = match safe_join(&project.path, rel) {
+        Ok(path) => path,
+        Err(e) => return err(400, e),
+    };
+    let meta = match fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) => return err(404, format!("File not found: {e}")),
+    };
+    if meta.len() > MAX_FILE_CONTENT_BYTES {
+        return err(413, "File is too large to return via API");
+    }
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => return err(415, "File is not valid UTF-8 text"),
+    };
+
+    let (fm_opt, body) = split_frontmatter(&content);
+    let mut frontmatter = serde_json::Map::new();
+    if let Some(fm) = fm_opt {
+        for line in fm.lines() {
+            let line = line.trim_end();
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                let key = k.trim();
+                if key.is_empty() {
+                    continue;
+                }
+                frontmatter.insert(key.to_string(), parse_frontmatter_value(v));
+            }
+        }
+    }
+
+    let images = build_image_payload(&api_public_base_url(app), body);
+    let wikilinks = extract_wikilinks(body);
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let title = commands::search::extract_title(&content, &file_name);
+
+    let page = json!({
+        "path": rel,
+        "type": frontmatter.get("type").cloned().unwrap_or(Value::Null),
+        "title": title,
+        "tags": frontmatter.get("tags").cloned().unwrap_or(Value::Array(vec![])),
+        "related": frontmatter.get("related").cloned().unwrap_or(Value::Array(vec![])),
+        "sources": frontmatter.get("sources").cloned().unwrap_or(Value::Array(vec![])),
+        "frontmatter": Value::Object(frontmatter),
+        "body": body,
+        "images": images,
+        "wikilinks": wikilinks,
+    });
+    ok(json!({ "ok": true, "projectId": project.id, "page": page }))
+}
+
+/// Split a markdown document into its YAML frontmatter block (if any) and body.
+/// Returns (Some(frontmatter_text), body) when the document starts with a `---`
+/// fence and has a closing `---` line; otherwise (None, full_content).
+fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
+    let c = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let after = match c
+        .strip_prefix("---\n")
+        .or_else(|| c.strip_prefix("---\r\n"))
+    {
+        Some(a) => a,
+        None => return (None, content),
+    };
+    let bytes = after.as_bytes();
+    let mut i = 0usize;
+    let mut line_start = 0usize;
+    while i <= bytes.len() {
+        let at_line_end = i == bytes.len() || bytes[i] == b'\n';
+        if at_line_end {
+            let line = after[line_start..i].trim_end_matches('\r');
+            if line.trim() == "---" {
+                let fm = &after[..line_start];
+                let body = if i < bytes.len() { &after[i + 1..] } else { "" };
+                return (Some(fm), body.trim_start_matches(['\n', '\r']));
+            }
+            line_start = i + 1;
+        }
+        i += 1;
+    }
+    (None, content)
+}
+
+/// Parse a single frontmatter value: inline arrays `[a, b, c]` → JSON array,
+/// otherwise a quote-stripped string.
+fn parse_frontmatter_value(raw: &str) -> Value {
+    let v = raw.trim();
+    if v.len() >= 2 && v.starts_with('[') && v.ends_with(']') {
+        let inner = &v[1..v.len() - 1];
+        let arr: Vec<Value> = inner
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .map(Value::String)
+            .collect();
+        return Value::Array(arr);
+    }
+    let s = v.trim_matches('"').trim_matches('\'');
+    Value::String(s.to_string())
+}
+
+/// Extract `(alt, target)` pairs from markdown `![alt](target)` image
+/// syntax, in document order. `alt` is the caption we inject during ingest
+/// (a Chinese Vision description); `target` is the project-relative media
+/// path. Alt is trimmed; targets are trimmed and empty targets skipped.
+fn extract_image_refs(body: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(p) = rest.find("![") {
+        rest = &rest[p + 2..];
+        let Some(open) = rest.find("](") else {
+            break;
+        };
+        let alt = rest[..open].trim().to_string();
+        let after = &rest[open + 2..];
+        let Some(close) = after.find(')') else {
+            rest = after;
+            continue;
+        };
+        let target = after[..close].trim();
+        if !target.is_empty() {
+            out.push((alt, target.to_string()));
+        }
+        rest = &after[close + 1..];
+    }
+    out
+}
+
+/// Build the `images` array for the agent page payload from a markdown
+/// body. Each unique image becomes `{ url, description, path }`:
+///   - `path`    — project-relative path the media proxy serves
+///                 (`media/<slug>/<file>` → `wiki/media/<slug>/<file>`).
+///   - `url`     — `base_url` + percent-encoded path: a directly-GETtable
+///                 link (the agent does no encoding of its own).
+///   - `description` — the injected Chinese Vision caption (the `![..]` alt).
+/// Images are deduplicated by resolved `path`, keeping first occurrence.
+/// Already-absolute `http(s)://` targets pass through unencoded.
+fn build_image_payload(base_url: &str, body: &str) -> Vec<Value> {
+    let mut seen_paths = std::collections::HashSet::new();
+    extract_image_refs(body)
+        .into_iter()
+        .filter_map(|(alt, target)| {
+            let is_absolute =
+                target.starts_with("http://") || target.starts_with("https://");
+            let path = if is_absolute {
+                target.clone()
+            } else if let Some(rest) = target.strip_prefix("media/") {
+                format!("wiki/media/{rest}")
+            } else {
+                target.clone()
+            };
+            if !seen_paths.insert(path.clone()) {
+                return None;
+            }
+            let url = if is_absolute {
+                path.clone()
+            } else {
+                let encoded = path
+                    .split('/')
+                    .map(percent_encode_segment)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                format!("{base_url}/{encoded}")
+            };
+            Some(json!({
+                "url": url,
+                "description": alt,
+                "path": path,
+            }))
+        })
+        .collect()
 }
 
 fn safe_join(project_path: &str, rel: &str) -> Result<PathBuf, String> {
@@ -1241,6 +1494,49 @@ mod tests {
         let parsed = parse_query("path=wiki%2Fhello+world.md&token=a%2Bb");
         assert_eq!(parsed.get("path").unwrap(), "wiki/hello world.md");
         assert_eq!(parsed.get("token").unwrap(), "a+b");
+    }
+
+    #[test]
+    fn percent_encode_segment_uses_encode_uri_component_semantics() {
+        // Unreserved set is left intact.
+        assert_eq!(percent_encode_segment("Abc-1_2.3~x"), "Abc-1_2.3~x");
+        // Space and the literal `%` (already in on-disk slugs) get encoded;
+        // `%20` becomes `%2520` so nginx decodes back to a literal `%20`.
+        assert_eq!(percent_encode_segment("m square"), "m%20square");
+        assert_eq!(percent_encode_segment("a%20b"), "a%2520b");
+        // CJK is UTF-8 byte-encoded.
+        assert_eq!(percent_encode_segment("心"), "%E5%BF%83");
+    }
+
+    #[test]
+    fn extract_image_refs_captures_alt_and_target() {
+        let body = "intro\n![一只猫](media/a/猫.jpg)\ntext ![](media/b.png) end";
+        let refs = extract_image_refs(body);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0], ("一只猫".to_string(), "media/a/猫.jpg".to_string()));
+        // Empty alt is allowed; empty target would be skipped.
+        assert_eq!(refs[1], (String::new(), "media/b.png".to_string()));
+    }
+
+    #[test]
+    fn build_image_payload_encodes_dedups_and_pairs_description() {
+        let body = "![绿色收纳袋](media/m%20square/001-心心_01.jpg)\n\
+                    ![绿色收纳袋](media/m%20square/001-心心_01.jpg)\n\
+                    ![外链图](https://cdn.example.com/x.png)";
+        let imgs = build_image_payload("https://wiki.aworld.ltd", body);
+        // Dedup by resolved path: the repeated media image collapses to one.
+        assert_eq!(imgs.len(), 2);
+        let first = &imgs[0];
+        assert_eq!(first["description"], "绿色收纳袋");
+        assert_eq!(first["path"], "wiki/media/m%20square/001-心心_01.jpg");
+        // `%`→`%25` and CJK→`%XX`; the `/` separators are preserved.
+        assert_eq!(
+            first["url"],
+            "https://wiki.aworld.ltd/wiki/media/m%2520square/001-%E5%BF%83%E5%BF%83_01.jpg"
+        );
+        // Absolute targets pass through untouched (no base prefix, no re-encode).
+        assert_eq!(imgs[1]["url"], "https://cdn.example.com/x.png");
+        assert_eq!(imgs[1]["path"], "https://cdn.example.com/x.png");
     }
 
     #[test]

@@ -67,7 +67,7 @@ import { streamChat, type ChatMessage } from "./llm-client"
  *     or markdown inside CAPTION corrupt the surrounding doc).
  */
 export const CAPTION_PROMPT =
-  "Describe this image factually for a knowledge-base index. Include: any visible text verbatim, chart axes and values, diagram structure (boxes/arrows/labels), key visual elements. Do NOT speculate or editorialize. 2 to 4 sentences. Output plain text only — no markdown, no preamble."
+  "用简体中文客观描述这张图片，供知识库索引使用。需包含：图中可见的文字（逐字照录）、图表的坐标轴与数值、示意图结构（方框/箭头/标签）、关键视觉元素（产品外观、颜色、材质、款式等）。不要臆测或评论。2 到 4 句话。只输出纯文本——不要 markdown，不要前言。必须用简体中文输出。"
 
 /**
  * Build the prompt that gets used WHEN the caller supplies
@@ -89,17 +89,17 @@ export function buildCaptionPromptWithContext(
     return trimmed.length > 0 ? trimmed : "(none)"
   }
   return [
-    "The image is embedded in a longer document. Here is the text that appears IMMEDIATELY BEFORE and AFTER this image in the source:",
+    "这张图片嵌入在一份较长的文档中。以下是源文档里紧邻该图片之前和之后的文字：",
     "",
-    "--- Text before image ---",
+    "--- 图片前的文字 ---",
     fmt(before),
-    "--- Text after image ---",
+    "--- 图片后的文字 ---",
     fmt(after),
-    "--- End surrounding text ---",
+    "--- 周边文字结束 ---",
     "",
-    "This surrounding text MAY help describe the image — for example, a sentence like \"Figure 3: Q2 revenue chart\" tells you what the chart actually plots. It MAY ALSO be unrelated body text that just happens to flank the image. Use your judgment: if a passage clearly identifies, references, or labels the image, anchor your caption to it; if not, ignore the surrounding text and describe what you see.",
+    "这些周边文字可能有助于描述图片——例如「图3：第二季度营收图表」这样的句子能告诉你图表实际画的是什么；也可能只是恰好出现在图片旁边的无关正文。请自行判断：若某段文字明确指认、引用或标注了该图片，就以它为锚点；若无关，则忽略周边文字，只描述你看到的内容。",
     "",
-    "Now describe the image factually for a knowledge-base index. Include: any visible text verbatim, chart axes and values, diagram structure (boxes/arrows/labels), key visual elements. If the surrounding text contains a relevant figure number / caption / referent, incorporate that specifically. Do NOT invent details that aren't visible in the image or directly stated in the surrounding text. 2 to 4 sentences. Output plain text only — no markdown, no preamble.",
+    "现在用简体中文客观描述这张图片，供知识库索引使用。需包含：图中可见的文字（逐字照录）、图表的坐标轴与数值、示意图结构（方框/箭头/标签）、关键视觉元素（产品外观、颜色、材质、款式等）。若周边文字含相关的图号/说明/指代，请具体纳入。不要臆造图中不可见、周边文字也未直接说明的细节。2 到 4 句话。只输出纯文本——不要 markdown，不要前言。必须用简体中文输出。",
   ].join("\n")
 }
 
