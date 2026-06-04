@@ -1,53 +1,11 @@
 import { describe, it, expect } from "vitest"
-import { buildAnthropicUrl, parseGoogleLine, getProviderConfig } from "../llm-providers"
+import { buildAnthropicUrl, parseGoogleLine, parseAnthropicLine, getProviderConfig } from "../llm-providers"
 import type { LlmConfig as RealLlmConfig } from "@/stores/wiki-store"
 
-// Inline minimal types to avoid store/zustand dependencies in unit tests
-type Provider = "openai" | "anthropic" | "google" | "azure" | "ollama" | "custom" | "minimax"
-
-interface LlmConfig {
-  provider: Provider
-  apiKey: string
-  model: string
-  ollamaUrl: string
-  customEndpoint: string
-  maxContextSize: number
-}
-
-// Re-implement the minimax case logic inline so we can unit-test it
-// without a browser environment or Tauri runtime. Keep this in sync with
-// the `case "minimax":` branch in src/lib/llm-providers.ts.
-function buildMiniMaxProviderConfig(config: LlmConfig) {
-  const { apiKey, model, customEndpoint } = config
-  const base = (customEndpoint || "https://api.minimax.io/anthropic").replace(/\/+$/, "")
-  // MiniMax's /anthropic endpoint requires Authorization: Bearer, NOT
-  // x-api-key. Its CORS preflight rejects x-api-key entirely. See the
-  // requiresBearerAuth() helper in src/lib/llm-providers.ts.
-  return {
-    url: `${base}/v1/messages`,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    buildBody: (messages: Array<{ role: string; content: string }>) => {
-      const systemMessages = messages.filter((m) => m.role === "system")
-      const conversationMessages = messages.filter((m) => m.role !== "system")
-      const system = systemMessages.map((m) => m.content).join("\n") || undefined
-      return {
-        messages: conversationMessages,
-        ...(system !== undefined ? { system } : {}),
-        stream: true,
-        max_tokens: 4096,
-        model,
-      }
-    },
-  }
-}
-
-const makeConfig = (overrides: Partial<LlmConfig> = {}): LlmConfig => ({
+const makeConfig = (overrides: Partial<RealLlmConfig> = {}): RealLlmConfig => ({
   provider: "minimax",
   apiKey: "test-key",
-  model: "MiniMax-M2.7",
+  model: "MiniMax-M3",
   ollamaUrl: "http://localhost:11434",
   customEndpoint: "",
   maxContextSize: 204800,
@@ -56,60 +14,66 @@ const makeConfig = (overrides: Partial<LlmConfig> = {}): LlmConfig => ({
 
 describe("MiniMax Provider", () => {
   it("uses the Anthropic Messages endpoint under /anthropic", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig())
+    const cfg = getProviderConfig(makeConfig())
     expect(cfg.url).toBe("https://api.minimax.io/anthropic/v1/messages")
   })
 
   it("supports the China regional endpoint via customEndpoint", () => {
-    const cfg = buildMiniMaxProviderConfig(
+    const cfg = getProviderConfig(
       makeConfig({ customEndpoint: "https://api.minimaxi.com/anthropic" }),
     )
     expect(cfg.url).toBe("https://api.minimaxi.com/anthropic/v1/messages")
   })
 
   it("uses Authorization: Bearer (MiniMax rejects x-api-key at CORS layer)", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig({ apiKey: "my-key" }))
+    const cfg = getProviderConfig(makeConfig({ apiKey: "my-key" }))
     expect(cfg.headers.Authorization).toBe("Bearer my-key")
     expect((cfg.headers as Record<string, string>)["x-api-key"]).toBeUndefined()
   })
 
   it("sets Content-Type to application/json", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig())
+    const cfg = getProviderConfig(makeConfig())
     expect(cfg.headers["Content-Type"]).toBe("application/json")
   })
 
   it("enables streaming", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig())
+    const cfg = getProviderConfig(makeConfig())
     const body = cfg.buildBody([]) as Record<string, unknown>
     expect(body.stream).toBe(true)
   })
 
   it("includes max_tokens (required by Anthropic wire)", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig())
+    const cfg = getProviderConfig(makeConfig())
     const body = cfg.buildBody([]) as Record<string, unknown>
     expect(body.max_tokens).toBe(4096)
   })
 
   it("carries the model in the body", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig({ model: "MiniMax-M2.7" }))
+    const cfg = getProviderConfig(makeConfig({ model: "MiniMax-M3" }))
     const body = cfg.buildBody([]) as Record<string, unknown>
-    expect(body.model).toBe("MiniMax-M2.7")
+    expect(body.model).toBe("MiniMax-M3")
   })
 
-  it("separates system messages from conversation (Anthropic convention)", () => {
-    const cfg = buildMiniMaxProviderConfig(makeConfig())
+  it("separates system messages from conversation and marks the system prompt cacheable", () => {
+    const cfg = getProviderConfig(makeConfig())
     const body = cfg.buildBody([
       { role: "system", content: "You are helpful" },
       { role: "user", content: "Hello" },
     ]) as Record<string, unknown>
-    expect(body.system).toBe("You are helpful")
+    expect(body.system).toEqual([
+      {
+        type: "text",
+        text: "You are helpful",
+        cache_control: { type: "ephemeral" },
+      },
+    ])
     expect(body.messages).toEqual([{ role: "user", content: "Hello" }])
   })
 })
 
 describe("MiniMax provider registration", () => {
   it("minimax is a valid provider value in the type union", () => {
-    const provider: Provider = "minimax"
+    const provider: RealLlmConfig["provider"] = "minimax"
     expect(provider).toBe("minimax")
   })
 })
@@ -164,6 +128,11 @@ describe("parseGoogleLine — Gemini SSE parsing", () => {
     expect(parseGoogleLine(line)).toBe("Hello")
   })
 
+  it("accepts SSE data lines without a space after the colon", () => {
+    const line = 'data:{"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}'
+    expect(parseGoogleLine(line)).toBe("Hello")
+  })
+
   it("concatenates text across multiple parts in one event", () => {
     // Gemini 2.5/3.x reasoning models sometimes split output across
     // multiple parts in a single streaming chunk. The old parser only
@@ -191,6 +160,56 @@ describe("parseGoogleLine — Gemini SSE parsing", () => {
 
   it("returns null for malformed JSON", () => {
     expect(parseGoogleLine("data: {not json")).toBeNull()
+  })
+})
+
+describe("parseAnthropicLine — Anthropic SSE parsing", () => {
+  it("extracts text from a standard text_delta event (with space)", () => {
+    const line = 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}'
+    expect(parseAnthropicLine(line)).toBe("Hello")
+  })
+
+  it("extracts text when delta.type is omitted (no-space SSE)", () => {
+    // Some third-party Anthropic-compatible gateways (e.g. Kimi Coding Plan)
+    // emit content_block_delta with a bare `text` field and no `type` inside
+    // delta, and sometimes omit the space after `data:`.
+    const line = 'data:{"type":"content_block_delta","index":0,"delta":{"text":"world"}}'
+    expect(parseAnthropicLine(line)).toBe("world")
+  })
+
+  it("extracts text from a complete message event (single-shot SSE)", () => {
+    const line =
+      'data: {"type":"message","id":"msg_01","role":"assistant","content":[{"type":"text","text":"Hello world"}]}'
+    expect(parseAnthropicLine(line)).toBe("Hello world")
+  })
+
+  it("concatenates all text blocks from a complete message event", () => {
+    const line =
+      'data: {"type":"message","id":"msg_01","role":"assistant","content":[{"type":"text","text":"Hello "},{"type":"tool_use","id":"tool_1"},{"type":"text","text":"world"}]}'
+    expect(parseAnthropicLine(line)).toBe("Hello world")
+  })
+
+  it("falls back to OpenAI-shaped delta.content when present", () => {
+    const line = 'data: {"choices":[{"delta":{"content":"fallback"}}]}'
+    expect(parseAnthropicLine(line)).toBe("fallback")
+  })
+
+  it("returns null for non-content-block-delta events without extractable text", () => {
+    const line = 'data: {"type":"message_start","message":{"id":"msg_01"}}'
+    expect(parseAnthropicLine(line)).toBeNull()
+  })
+
+  it("returns null for non-data lines", () => {
+    expect(parseAnthropicLine("event: start")).toBeNull()
+    expect(parseAnthropicLine("")).toBeNull()
+  })
+})
+
+describe("parseOpenAiLine — OpenAI-compatible SSE parsing", () => {
+  it("accepts SSE data lines without a space after the colon", () => {
+    const cfg = getProviderConfig(makeConfig({ provider: "openai", model: "gpt-4.1" }))
+    const line = 'data:{"choices":[{"delta":{"content":"Hello"}}]}'
+    expect(cfg.parseStream(line)).toBe("Hello")
   })
 })
 

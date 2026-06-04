@@ -522,11 +522,11 @@ describe("autoIngest source summary paths", () => {
     )
 
     const canonicalSummary = `wiki/sources/${sourceSummarySlugFromIdentity("project-a/config.yaml")}.md`
-    const canonicalSummaryPath = path.join(tmp.path, canonicalSummary)
+    const canonicalSummaryPath = path.join(tmp.path, canonicalSummary).replace(/\\/g, "/")
     const staleSummaryPath = path.join(tmp.path, "wiki", "sources", "config.md")
     const content = await fs.readFile(canonicalSummaryPath, "utf8")
 
-    expect(writtenPaths).toEqual([canonicalSummaryPath])
+    expect(writtenPaths.map((p) => p.replace(/\\/g, "/"))).toEqual([canonicalSummaryPath])
     await expect(fs.access(staleSummaryPath)).rejects.toThrow()
     expect(content).toContain('sources: ["project-a/config.yaml"]')
   })

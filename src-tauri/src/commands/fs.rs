@@ -23,7 +23,7 @@ const MEDIA_EXTS: &[&str] = &[
 const LEGACY_DOC_EXTS: &[&str] = &["ppt", "pages", "numbers", "key", "epub"];
 
 #[tauri::command]
-pub async fn read_file(path: String) -> Result<String, String> {
+pub async fn read_file(path: String, extract_images: Option<bool>) -> Result<String, String> {
     // `spawn_blocking` is REQUIRED, not a perf nicety. The body does
     // synchronous PDF/Office text extraction (pdfium FFI, calamine,
     // zip + image decode) that can take 10s+ on big files. Running
@@ -46,8 +46,10 @@ pub async fn read_file(path: String) -> Result<String, String> {
                 return Ok(cached);
             }
 
+            let include_images = extract_images.unwrap_or(true);
+
             match ext.as_str() {
-                "pdf" => extract_pdf_text(&path),
+                "pdf" => extract_pdf_text(&path, include_images),
                 e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e),
                 e if IMAGE_EXTS.contains(&e) => {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -98,7 +100,7 @@ pub async fn preprocess_file(path: String) -> Result<String, String> {
                 .to_lowercase();
 
             let text = match ext.as_str() {
-                "pdf" => extract_pdf_text(&path)?,
+                "pdf" => extract_pdf_text(&path, false)?,
                 e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e)?,
                 _ => return Ok("no preprocessing needed".to_string()),
             };
@@ -317,69 +319,51 @@ pub(crate) fn pdfium() -> Result<&'static pdfium_render::prelude::Pdfium, String
         .map_err(|e| e.clone())
 }
 
-/// Extract a PDF as markdown — text + per-page image references
-/// when the file lives under a project's `raw/sources/` (the
-/// layout the import pipeline produces). Falls back to text-only
-/// when the PDF is opened from anywhere else.
-///
-/// Layout heuristic: a PDF at `<project>/raw/sources/<name>.pdf`
-/// implies project root = `<project>` and image dest =
-/// `<project>/wiki/media/<name>/`. We use absolute filesystem paths
-/// in the emitted `![](url)` references so the markdown previews
-/// (raw-source view AND wiki-summary view) both render via
-/// `convertFileSrc` without anyone having to know which directory
-/// they're rendering from.
+/// Extract a PDF as markdown. When `include_images` is true and the PDF
+/// is opened directly from `<project>/raw/sources`, this also writes
+/// preview images to `<project>/wiki/media/<file-stem>/` and emits image
+/// markdown. Ingest passes `include_images=false` and owns image
+/// extraction through the canonical source-identity slug, preventing a
+/// duplicate `<file-stem>` media folder for nested sources.
 ///
 /// Lock: delegates to `extract_pdf_markdown`, which acquires the
 /// pdfium lock internally. We must NOT take it here too —
 /// `std::sync::Mutex` is non-reentrant.
-fn extract_pdf_text(path: &str) -> Result<String, String> {
+fn extract_pdf_text(path: &str, include_images: bool) -> Result<String, String> {
     use crate::commands::extract_images::{extract_pdf_markdown, ExtractOptions};
 
-    let p = Path::new(path);
-    let parent = p.parent();
-    let stem = p
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+    if include_images {
+        let p = Path::new(path);
+        let parent = p.parent();
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
 
-    // The path-component check uses `ends_with` on `Path` which
-    // matches the LAST component (not a string-suffix check), so
-    // `/foo/raw/sources/bar.pdf` correctly identifies as under
-    // `raw/sources/` while `/foo/braw/source-thing/bar.pdf` does
-    // not.
-    let parent_is_sources = parent.map(|d| d.ends_with("sources")).unwrap_or(false);
-    let raw_dir = parent.and_then(|d| d.parent());
-    let raw_is_raw = raw_dir.map(|d| d.ends_with("raw")).unwrap_or(false);
-    let project_root = if parent_is_sources && raw_is_raw {
-        raw_dir.and_then(|d| d.parent())
-    } else {
-        None
-    };
+        let parent_is_sources = parent.map(|d| d.ends_with("sources")).unwrap_or(false);
+        let raw_dir = parent.and_then(|d| d.parent());
+        let raw_is_raw = raw_dir.map(|d| d.ends_with("raw")).unwrap_or(false);
+        let project_root = if parent_is_sources && raw_is_raw {
+            raw_dir.and_then(|d| d.parent())
+        } else {
+            None
+        };
 
-    if let Some(root) = project_root {
-        if !stem.is_empty() {
-            let media_dir = root.join("wiki").join("media").join(&stem);
-            // Forward-slash absolute path so we don't ship `\` into
-            // markdown that the JS-side resolver would then have to
-            // re-normalize. The resolver does handle backslashes,
-            // but emitting clean URLs in the first place avoids
-            // surprises in cache files we save to disk.
-            let url_prefix = media_dir.to_string_lossy().replace('\\', "/");
-            return extract_pdf_markdown(
-                path,
-                Some(&media_dir),
-                &url_prefix,
-                &ExtractOptions::default(),
-            );
+        if let Some(root) = project_root {
+            if !stem.is_empty() {
+                let media_dir = root.join("wiki").join("media").join(&stem);
+                let url_prefix = media_dir.to_string_lossy().replace('\\', "/");
+                return extract_pdf_markdown(
+                    path,
+                    Some(&media_dir),
+                    &url_prefix,
+                    &ExtractOptions::default(),
+                );
+            }
         }
     }
 
-    // PDFs not under <project>/raw/sources/ — text-only fallback.
-    // Skip the image side of the extraction entirely (no media
-    // destination → extract_pdf_markdown only writes text + page
-    // headers, no pdfium image-object enumeration).
     extract_pdf_markdown(path, None, "", &ExtractOptions::default())
 }
 
@@ -1568,7 +1552,7 @@ mod tests {
 
         for (name, bytes) in payloads {
             let path = tmp_pdf_with_bytes(bytes);
-            let result = read_file(path.clone()).await;
+            let result = read_file(path.clone(), None).await;
             let _ = fs::remove_file(&path);
             eprintln!(
                 "[{name}] => {:?}",
@@ -1583,7 +1567,11 @@ mod tests {
     /// through read_file's guarded path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_file_returns_err_on_missing_file_instead_of_panicking() {
-        let result = read_file("/nonexistent/path/that/does/not/exist.pdf".to_string()).await;
+        let result = read_file(
+            "/nonexistent/path/that/does/not/exist.pdf".to_string(),
+            None,
+        )
+        .await;
         assert!(result.is_err() || result.is_ok()); // must at least return
     }
 
@@ -1649,7 +1637,7 @@ mod tests {
             // Call extract_pdf_text directly (not read_file) so we bypass
             // the .cache sibling dir and always exercise the parser.
             let path_str = path.to_string_lossy().to_string();
-            let result = std::panic::catch_unwind(|| extract_pdf_text(&path_str));
+            let result = std::panic::catch_unwind(|| extract_pdf_text(&path_str, true));
             match result {
                 Ok(Ok(text)) => {
                     ok += 1;

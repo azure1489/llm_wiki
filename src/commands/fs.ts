@@ -8,8 +8,14 @@ interface RawProject {
   path: string
 }
 
-export async function readFile(path: string): Promise<string> {
-  return invoke<string>("read_file", { path })
+export async function readFile(
+  path: string,
+  options?: { extractImages?: boolean },
+): Promise<string> {
+  return invoke<string>("read_file", {
+    path,
+    extractImages: options?.extractImages,
+  })
 }
 
 export async function writeFile(path: string, contents: string): Promise<void> {
@@ -120,4 +126,8 @@ export async function apiServerStatus(): Promise<string> {
 
 export async function apiServerReloadConfig(): Promise<string> {
   return invoke<string>("api_server_reload_config")
+}
+
+export async function mcpServerEntryPath(): Promise<string> {
+  return invoke<string>("mcp_server_entry_path")
 }

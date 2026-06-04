@@ -96,7 +96,7 @@ export function AppLayout({ onSwitchProject }: AppLayoutProps) {
     // existing IconSidebar + content row below. Banner is shrink-0
     // so it doesn't compress the work area; main row is flex-1 so
     // it fills the rest of the viewport.
-    <div className="flex h-screen flex-col bg-background text-foreground">
+    <div className="flex h-full flex-col bg-background text-foreground">
       <UpdateBanner />
       <div className="flex min-h-0 flex-1">
         <IconSidebar onSwitchProject={onSwitchProject} />

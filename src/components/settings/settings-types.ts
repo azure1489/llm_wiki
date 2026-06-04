@@ -1,5 +1,5 @@
 import type { CustomApiMode } from "./llm-presets"
-import type { AzureModelFamily, ReasoningConfig, SourceWatchConfig } from "@/stores/wiki-store"
+import type { AzureModelFamily, CloseBehavior, ReasoningConfig, SourceWatchConfig } from "@/stores/wiki-store"
 
 /**
  * Shape of the draft state each section reads from and writes into.
@@ -65,6 +65,11 @@ export interface SettingsDraft {
 
   // UI
   uiLanguage: string
+  theme: "light" | "dark" | "system"
+
+  // General app behavior
+  autostart: boolean
+  closeBehavior: CloseBehavior
 
   // Source folder auto watch
   sourceWatchConfig: SourceWatchConfig
@@ -72,6 +77,7 @@ export interface SettingsDraft {
   // Local HTTP API server
   apiEnabled: boolean
   apiAllowUnauthenticated: boolean
+  apiMcpEnabled: boolean
   apiToken: string
 }
 

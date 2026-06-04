@@ -17,6 +17,7 @@ import { useWikiStore } from "@/stores/wiki-store"
 import { writeFile, readFile, listDirectory, deleteFile } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
 import { hasConfiguredDeepResearchSources } from "@/lib/web-search"
+import { makeQueryFileName } from "@/lib/wiki-filename"
 import { useTranslation } from "react-i18next"
 
 const typeConfig: Record<ReviewItem["type"], { icon: typeof AlertTriangle; label: string; color: string }> = {
@@ -70,24 +71,23 @@ export function ReviewView() {
           .replace(/<!--\s*sources:.*?-->/g, "")
           .trimEnd()
 
-        // Generate filename
         const firstLine = cleanContent.split("\n").find((l) => l.trim() && !l.startsWith("<!--"))?.replace(/^#+\s*/, "").trim() ?? "Saved Query"
-        const title = firstLine.slice(0, 60)
-        const slug = title.toLowerCase().replace(/[^a-z0-9\s-]/g, "").trim().replace(/\s+/g, "-").slice(0, 50)
-        const date = new Date().toISOString().slice(0, 10)
-        const fileName = `${slug}-${date}.md`
+        const title = firstLine.slice(0, 60) || "Saved Query"
+        const { date, fileName } = makeQueryFileName(title)
         const filePath = `${pp}/wiki/queries/${fileName}`
 
         const frontmatter = `---\ntype: query\ntitle: "${title.replace(/"/g, '\\"')}"\ncreated: ${date}\ntags: []\n---\n\n`
-        await writeFile(filePath, frontmatter + cleanContent)
+        const pageContent = frontmatter + cleanContent
+        await writeFile(filePath, pageContent)
 
         // Update index
         const indexPath = `${pp}/wiki/index.md`
         let indexContent = ""
         try { indexContent = await readFile(indexPath) } catch { indexContent = "# Wiki Index\n" }
-        const entry = `- [[queries/${slug}-${date}|${title}]]`
+        const linkTarget = fileName.replace(/\.md$/, "")
+        const entry = `- [[queries/${linkTarget}|${title}]]`
         if (indexContent.includes("## Queries")) {
-          indexContent = indexContent.replace(/(## Queries\n)/, `$1${entry}\n`)
+          indexContent = indexContent.replace(/(## Queries\n)/, (match) => `${match}${entry}\n`)
         } else {
           indexContent = indexContent.trimEnd() + "\n\n## Queries\n" + entry + "\n"
         }
@@ -102,6 +102,9 @@ export function ReviewView() {
         // Refresh tree
         const tree = await listDirectory(pp)
         setFileTree(tree)
+        useWikiStore.getState().setSelectedFile(filePath)
+        useWikiStore.getState().setFileContent(pageContent)
+        useWikiStore.getState().bumpDataVersion()
 
         resolveItem(id, "Saved to Wiki")
       } catch (err) {
@@ -175,27 +178,27 @@ export function ReviewView() {
       if (item) {
         try {
           const title = item.title.replace(/^(Create|Save|Add)[:\s]*/i, "").trim() || "Untitled"
-          const slug = title.toLowerCase().replace(/[^a-z0-9\s-]/g, "").trim().replace(/\s+/g, "-").slice(0, 50)
-          const date = new Date().toISOString().slice(0, 10)
+          const { date, fileName } = makeQueryFileName(title)
 
           // Determine page type from review type or action text
           const pageType = detectPageType(realAction, item.type)
           const dir = pageType === "query" ? "queries" : pageType === "entity" ? "entities" : pageType === "concept" ? "concepts" : "queries"
-          const fileName = `${slug}-${date}.md`
           const filePath = `${pp}/wiki/${dir}/${fileName}`
 
           const frontmatter = `---\ntype: ${pageType}\ntitle: "${title.replace(/"/g, '\\"')}"\ncreated: ${date}\ntags: []\nrelated: []\n---\n\n`
           const body = `# ${title}\n\n${item.description}\n`
-          await writeFile(filePath, frontmatter + body)
+          const pageContent = frontmatter + body
+          await writeFile(filePath, pageContent)
 
           // Update index
           const indexPath = `${pp}/wiki/index.md`
           let indexContent = ""
           try { indexContent = await readFile(indexPath) } catch { indexContent = "# Wiki Index\n" }
           const sectionHeader = `## ${dir.charAt(0).toUpperCase() + dir.slice(1)}`
-          const entry = `- [[${dir}/${slug}-${date}|${title}]]`
+          const linkTarget = fileName.replace(/\.md$/, "")
+          const entry = `- [[${dir}/${linkTarget}|${title}]]`
           if (indexContent.includes(sectionHeader)) {
-            indexContent = indexContent.replace(new RegExp(`(${sectionHeader}\n)`), `$1${entry}\n`)
+            indexContent = indexContent.replace(new RegExp(`(${sectionHeader}\n)`), (match) => `${match}${entry}\n`)
           } else {
             indexContent = indexContent.trimEnd() + `\n\n${sectionHeader}\n${entry}\n`
           }
@@ -210,6 +213,8 @@ export function ReviewView() {
           // Refresh
           const tree = await listDirectory(pp)
           setFileTree(tree)
+          useWikiStore.getState().setSelectedFile(filePath)
+          useWikiStore.getState().setFileContent(pageContent)
           useWikiStore.getState().bumpDataVersion()
 
           resolveItem(id, `Created: wiki/${dir}/${fileName}`)

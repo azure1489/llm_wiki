@@ -50,7 +50,67 @@ pub struct DetectResult {
 pub struct ClaudeMessage {
     /// "system" | "user" | "assistant"
     role: String,
-    content: String,
+    content: ClaudeContent,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum ClaudeContent {
+    Text(String),
+    Blocks(Vec<ClaudeContentBlock>),
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type")]
+enum ClaudeContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image {
+        #[serde(rename = "mediaType")]
+        media_type: String,
+        #[serde(rename = "dataBase64")]
+        data_base64: String,
+    },
+}
+
+fn claude_content_text_only(content: &ClaudeContent) -> String {
+    match content {
+        ClaudeContent::Text(text) => text.clone(),
+        ClaudeContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ClaudeContentBlock::Text { text } => Some(text.as_str()),
+                ClaudeContentBlock::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+fn claude_content_blocks(content: &ClaudeContent) -> Vec<serde_json::Value> {
+    match content {
+        ClaudeContent::Text(text) => vec![serde_json::json!({ "type": "text", "text": text })],
+        ClaudeContent::Blocks(blocks) => blocks
+            .iter()
+            .map(|block| match block {
+                ClaudeContentBlock::Text { text } => {
+                    serde_json::json!({ "type": "text", "text": text })
+                }
+                ClaudeContentBlock::Image {
+                    media_type,
+                    data_base64,
+                } => serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data_base64,
+                    },
+                }),
+            })
+            .collect(),
+    }
 }
 
 fn find_claude_command() -> Result<PathBuf, String> {
@@ -159,7 +219,7 @@ pub async fn claude_cli_spawn(
     let system_preamble: String = messages
         .iter()
         .filter(|m| m.role == "system")
-        .map(|m| m.content.clone())
+        .map(|m| claude_content_text_only(&m.content))
         .collect::<Vec<_>>()
         .join("\n\n");
 
@@ -174,13 +234,16 @@ pub async fn claude_cli_spawn(
 
     // Synthesize turns with the preamble merged into the first user turn.
     let mut first_user_seen = false;
-    let turns: Vec<(String, String)> = conversation
+    let turns: Vec<(String, Vec<serde_json::Value>)> = conversation
         .iter()
         .map(|m| {
             let role = m.role.clone();
-            let mut content = m.content.clone();
+            let mut content = claude_content_blocks(&m.content);
             if !first_user_seen && role == "user" && !system_preamble.is_empty() {
-                content = format!("{system_preamble}\n\n{content}");
+                content.insert(
+                    0,
+                    serde_json::json!({ "type": "text", "text": format!("{system_preamble}\n\n") }),
+                );
                 first_user_seen = true;
             }
             (role, content)
@@ -235,7 +298,7 @@ pub async fn claude_cli_spawn(
             "type": role,
             "message": {
                 "role": role,
-                "content": [{ "type": "text", "text": content }],
+                "content": content,
             }
         });
         let line = format!("{}\n", event);
@@ -338,4 +401,46 @@ pub async fn claude_cli_kill(
         // enough; kill_on_drop ensures the SIGKILL is sent.
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_content_blocks_maps_frontend_image_blocks_to_anthropic_shape() {
+        let content: ClaudeContent = serde_json::from_value(serde_json::json!([
+            { "type": "text", "text": "describe this" },
+            { "type": "image", "mediaType": "image/png", "dataBase64": "abc123" }
+        ]))
+        .expect("content block payload should deserialize");
+
+        let blocks = claude_content_blocks(&content);
+
+        assert_eq!(
+            blocks,
+            vec![
+                serde_json::json!({ "type": "text", "text": "describe this" }),
+                serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "abc123",
+                    },
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_text_drops_images_before_inlining_preamble() {
+        let content: ClaudeContent = serde_json::from_value(serde_json::json!([
+            { "type": "text", "text": "system rule" },
+            { "type": "image", "mediaType": "image/png", "dataBase64": "abc123" }
+        ]))
+        .expect("content block payload should deserialize");
+
+        assert_eq!(claude_content_text_only(&content), "system rule");
+    }
 }

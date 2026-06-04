@@ -61,6 +61,13 @@ const COMMUNITY_COLORS = [
 ]
 
 type ColorMode = "type" | "community"
+type GraphThemePalette = {
+  defaultEdge: string
+  label: string
+  mutedNodeMixTarget: string
+  dimmedEdge: string
+  activeEdge: string
+}
 
 const BASE_NODE_SIZE = 8
 const MAX_NODE_SIZE = 28
@@ -70,6 +77,39 @@ const GRAPH_SPACING_DEBOUNCE_MS = 180
 const WORKER_LAYOUT_NODE_THRESHOLD = 220
 
 type HoverState = { node: string; neighbors: Set<string> } | null
+
+function graphThemePalette(isDark: boolean): GraphThemePalette {
+  return isDark
+    ? {
+        defaultEdge: "rgba(100,116,139,0.18)",
+        label: "#e2e8f0",
+        mutedNodeMixTarget: "#334155",
+        dimmedEdge: "rgba(71,85,105,0.12)",
+        activeEdge: "#38bdf8",
+      }
+    : {
+        defaultEdge: "#cbd5e1",
+        label: "#1e293b",
+        mutedNodeMixTarget: "#e2e8f0",
+        dimmedEdge: "rgba(148,163,184,0.22)",
+        activeEdge: "#1e293b",
+      }
+}
+
+function useResolvedDarkMode(): boolean {
+  const [isDark, setIsDark] = useState(() => document.documentElement.classList.contains("dark"))
+
+  useEffect(() => {
+    const root = document.documentElement
+    const sync = () => setIsDark(root.classList.contains("dark"))
+    sync()
+    const observer = new MutationObserver(sync)
+    observer.observe(root, { attributes: true, attributeFilter: ["class"] })
+    return () => observer.disconnect()
+  }, [])
+
+  return isDark
+}
 
 function nodeColor(type: string): string {
   if (NODE_TYPE_COLORS[type]) return NODE_TYPE_COLORS[type]
@@ -329,10 +369,12 @@ function GraphRenderSettings({
   hoverState,
   highlightedNodes,
   nodeCount,
+  palette,
 }: {
   hoverState: HoverState
   highlightedNodes: Set<string>
   nodeCount: number
+  palette: GraphThemePalette
 }) {
   const sigma = useSigma()
   const setSettings = useSetSettings()
@@ -363,7 +405,7 @@ function GraphRenderSettings({
           result.forceLabel = true
         }
         if ((hasHover && !isHoverNode && !isHoverNeighbor) || (hasHighlight && !isHighlighted)) {
-          result.color = mixColor(attrs.color ?? "#94a3b8", "#e2e8f0", 0.75)
+          result.color = mixColor(attrs.color ?? "#94a3b8", palette.mutedNodeMixTarget, 0.75)
           result.label = ""
           result.size = (attrs.size ?? BASE_NODE_SIZE) * 0.6
         }
@@ -383,18 +425,18 @@ function GraphRenderSettings({
           return result
         }
         if ((hasHover && !hoverEdge) || (hasHighlight && !highlightedEdge)) {
-          result.color = "#f1f5f9"
+          result.color = palette.dimmedEdge
           result.size = 0.3
         }
         if (hoverEdge || highlightedEdge) {
-          result.color = "#1e293b"
+          result.color = palette.activeEdge
           result.size = Math.max(2, (attrs.size ?? 1) * 1.5)
         }
         return result
       },
     })
     sigma.refresh()
-  }, [setSettings, sigma, hoverState, highlightedNodes, nodeCount])
+  }, [setSettings, sigma, hoverState, highlightedNodes, nodeCount, palette])
 
   return null
 }
@@ -498,6 +540,8 @@ export function GraphView() {
   const dataVersion = useWikiStore((s) => s.dataVersion)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
   const setFileContent = useWikiStore((s) => s.setFileContent)
+  const isDarkMode = useResolvedDarkMode()
+  const graphPalette = useMemo(() => graphThemePalette(isDarkMode), [isDarkMode])
 
   const [nodes, setNodes] = useState<GraphNode[]>([])
   const [edges, setEdges] = useState<GraphEdge[]>([])
@@ -945,7 +989,7 @@ export function GraphView() {
         {/* Graph canvas */}
         <div
           ref={graphContainerRef}
-          className="relative flex-1 min-w-0 overflow-hidden bg-slate-50 dark:bg-slate-950"
+          className="relative flex-1 min-w-0 overflow-hidden bg-background"
           onContextMenu={(e) => e.preventDefault()}
           onClick={() => setNodeMenu(null)}
         >
@@ -964,11 +1008,11 @@ export function GraphView() {
                     renderEdgeLabels: false,
                     hideEdgesOnMove: true,
                     hideLabelsOnMove: true,
-                    defaultEdgeColor: "#cbd5e1",
+                    defaultEdgeColor: graphPalette.defaultEdge,
                     defaultNodeColor: "#94a3b8",
                     labelSize: 13,
                     labelWeight: "bold",
-                    labelColor: { color: "#1e293b" },
+                    labelColor: { color: graphPalette.label },
                     stagePadding: 30,
                   }}
                 >
@@ -988,6 +1032,7 @@ export function GraphView() {
                     hoverState={hoverState}
                     highlightedNodes={searchActive ? searchedGraph.matchedNodeIds : highlightedNodes}
                     nodeCount={searchedGraph.nodes.length}
+                    palette={graphPalette}
                   />
                   <ZoomControls />
                 </SigmaContainer>

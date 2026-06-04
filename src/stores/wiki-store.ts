@@ -176,6 +176,9 @@ interface ScheduledImportConfig {
  *     env-token-only setup keeps working after the toggle is added.
  *   - `allowUnauthenticated` lets local agents call the API without a
  *     token. It is explicit and default-off.
+ *   - `mcpEnabled` allows the optional MCP stdio server to use this
+ *     API. It is separate from the HTTP API kill-switch so users can
+ *     expose scripts while keeping MCP disabled.
  *   - `token` is the bearer secret. Empty + auth required =
  *     every non-/health request returns 401. The env var
  *     `LLM_WIKI_API_TOKEN` overrides this field at the backend.
@@ -183,7 +186,15 @@ interface ScheduledImportConfig {
 interface ApiConfig {
   enabled: boolean
   allowUnauthenticated: boolean
+  mcpEnabled: boolean
   token: string
+}
+
+export type CloseBehavior = "ask" | "minimize" | "exit"
+
+export interface GeneralConfig {
+  autostart: boolean
+  closeBehavior: CloseBehavior
 }
 
 interface SourceWatchConfig {
@@ -305,6 +316,7 @@ interface WikiState {
   scheduledImportConfig: ScheduledImportConfig
   sourceWatchConfig: SourceWatchConfig
   apiConfig: ApiConfig
+  generalConfig: GeneralConfig
   dataVersion: number
 
   setProject: (project: WikiProject | null) => void
@@ -326,6 +338,7 @@ interface WikiState {
   setScheduledImportConfig: (config: ScheduledImportConfig) => void
   setSourceWatchConfig: (config: SourceWatchConfig) => void
   setApiConfig: (config: ApiConfig) => void
+  setGeneralConfig: (config: GeneralConfig) => void
   bumpDataVersion: () => void
 }
 
@@ -428,7 +441,13 @@ export const useWikiStore = create<WikiState>((set) => ({
   apiConfig: {
     enabled: true,
     allowUnauthenticated: false,
+    mcpEnabled: false,
     token: "",
+  },
+
+  generalConfig: {
+    autostart: false,
+    closeBehavior: "minimize",
   },
 
   setLlmConfig: (llmConfig) => set({ llmConfig }),
@@ -442,6 +461,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   setScheduledImportConfig: (scheduledImportConfig) => set({ scheduledImportConfig }),
   setSourceWatchConfig: (sourceWatchConfig) => set({ sourceWatchConfig }),
   setApiConfig: (apiConfig) => set({ apiConfig }),
+  setGeneralConfig: (generalConfig) => set({ generalConfig }),
   bumpDataVersion: () => set((state) => ({ dataVersion: state.dataVersion + 1 })),
 }))
 

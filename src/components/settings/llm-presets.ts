@@ -300,6 +300,22 @@ export const LLM_PRESETS: LlmPreset[] = [
     suggestedContextSize: 256000,
   },
   {
+    id: "kimi-coding-plan",
+    label: "Kimi (Coding Plan)",
+    hint: "api.kimi.com",
+    provider: "custom",
+    baseUrl: "https://api.kimi.com/coding/",
+    defaultModel: "kimi-for-coding",
+    apiMode: "chat_completions",
+    // Kimi Coding Plan is a separate subscription service from the
+    // Moonshot open platform. It supports both OpenAI-compatible
+    // (chat_completions) and Anthropic-compatible (anthropic_messages)
+    // wires on the same base URL. The Anthropic wire requires Bearer
+    // auth (see requiresBearerAuth in llm-providers.ts).
+    suggestedModels: ["kimi-for-coding"],
+    suggestedContextSize: 256000,
+  },
+  {
     id: "zhipu",
     label: "智谱 GLM (Zhipu)",
     hint: "open.bigmodel.cn",
@@ -331,11 +347,13 @@ export const LLM_PRESETS: LlmPreset[] = [
     hint: "api.minimax.io/anthropic",
     provider: "custom",
     baseUrl: "https://api.minimax.io/anthropic",
-    defaultModel: "MiniMax-M2.7",
+    defaultModel: "MiniMax-M3",
     apiMode: "anthropic_messages",
-    // Current-gen only. M2 and M2.1 are legacy and being retired —
-    // users who need them can type the id into the custom input.
-    suggestedModels: ["MiniMax-M2.7", "MiniMax-M2.5"],
+    // M3 is the current-gen default; M2.7 stays as a fallback for users
+    // pinned to it. Older M2.5 / M2.1 / M2 are legacy and have been
+    // dropped — users who still need them can type the id into the
+    // custom input.
+    suggestedModels: ["MiniMax-M3", "MiniMax-M2.7"],
     suggestedContextSize: 200000,
   },
   {
@@ -344,9 +362,9 @@ export const LLM_PRESETS: LlmPreset[] = [
     hint: "api.minimaxi.com/anthropic",
     provider: "custom",
     baseUrl: "https://api.minimaxi.com/anthropic",
-    defaultModel: "MiniMax-M2.7",
+    defaultModel: "MiniMax-M3",
     apiMode: "anthropic_messages",
-    suggestedModels: ["MiniMax-M2.7", "MiniMax-M2.5"],
+    suggestedModels: ["MiniMax-M3", "MiniMax-M2.7"],
     suggestedContextSize: 200000,
   },
   {

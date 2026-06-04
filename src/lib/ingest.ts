@@ -1,4 +1,13 @@
-import { createDirectory, deleteFile, fileExists, readFile, writeFile, listDirectory } from "@/commands/fs"
+import {
+  createDirectory,
+  deleteFile,
+  fileExists,
+  getFileModifiedTime,
+  getFileSize,
+  readFile,
+  writeFile,
+  listDirectory,
+} from "@/commands/fs"
 import { streamChat } from "@/lib/llm-client"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -48,6 +57,69 @@ function appendSavedImageRefsForCaption(content: string, images: SavedImage[]): 
     .map((relPath) => `![](${relPath})`)
   if (refs.length === 0) return content
   return `${content}\n\n## Referenced Local Images\n\n${refs.join("\n")}\n`
+}
+
+const ingestImageExtractionPromises = new Map<string, Promise<SavedImage[]>>()
+
+async function imageExtractionKey(
+  projectPath: string,
+  sourcePath: string,
+  sourceSummarySlug: string,
+): Promise<string> {
+  const normalizedSource = normalizePath(sourcePath)
+  let fingerprint: string
+  try {
+    const [size, mtime] = await Promise.all([
+      getFileSize(normalizedSource),
+      getFileModifiedTime(normalizedSource),
+    ])
+    fingerprint = `${size}:${mtime}`
+  } catch {
+    // If the source disappeared or stat fails, avoid reusing a stale
+    // promise from a previous ingest of the same path.
+    fingerprint = `unstable:${Date.now()}`
+  }
+  return `${normalizePath(projectPath)}\n${normalizedSource}\n${sourceSummarySlug}\n${fingerprint}`
+}
+
+function rememberImageExtractionByKey(
+  key: string,
+  promise: Promise<SavedImage[]>,
+): Promise<SavedImage[]> {
+  ingestImageExtractionPromises.set(key, promise)
+  if (ingestImageExtractionPromises.size > 32) {
+    const oldest = ingestImageExtractionPromises.keys().next().value
+    if (oldest) ingestImageExtractionPromises.delete(oldest)
+  }
+  promise.catch(() => {
+    if (ingestImageExtractionPromises.get(key) === promise) {
+      ingestImageExtractionPromises.delete(key)
+    }
+  })
+  return promise
+}
+
+function extractSourceImagesOnceByKey(
+  key: string,
+  projectPath: string,
+  sourcePath: string,
+  sourceSummarySlug: string,
+): Promise<SavedImage[]> {
+  const existing = ingestImageExtractionPromises.get(key)
+  if (existing) return existing
+  return rememberImageExtractionByKey(
+    key,
+    extractAndSaveSourceImages(projectPath, sourcePath, sourceSummarySlug),
+  )
+}
+
+async function extractSourceImagesOnce(
+  projectPath: string,
+  sourcePath: string,
+  sourceSummarySlug: string,
+): Promise<SavedImage[]> {
+  const key = await imageExtractionKey(projectPath, sourcePath, sourceSummarySlug)
+  return extractSourceImagesOnceByKey(key, projectPath, sourcePath, sourceSummarySlug)
 }
 
 function isSavedImagePromptUrl(projectPath: string, sourceSummarySlug: string, url: string): boolean {
@@ -401,7 +473,7 @@ async function autoIngestImpl(
   })
 
   const [sourceContent, schema, purpose, index, overview] = await Promise.all([
-    tryReadFile(sp),
+    tryReadSourceTextFile(sp),
     tryReadFile(`${pp}/schema.md`),
     tryReadFile(`${pp}/purpose.md`),
     tryReadFile(`${pp}/wiki/index.md`),
@@ -567,7 +639,7 @@ async function autoIngestImpl(
   // "the curated wiki knowledge".
   let enrichedSourceContent = stripWikiMediaAbsPaths(
     pp,
-    appendSavedImageRefsForCaption(sourceContent, markdownImages),
+    appendSavedImageRefsForCaption(sourceContent, savedImages),
   )
   const mmCfg = useWikiStore.getState().multimodalConfig
   const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
@@ -1588,6 +1660,14 @@ async function tryReadFile(path: string): Promise<string> {
   }
 }
 
+async function tryReadSourceTextFile(path: string): Promise<string> {
+  try {
+    return await readFile(path, { extractImages: false })
+  } catch {
+    return ""
+  }
+}
+
 function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
@@ -2258,7 +2338,7 @@ export async function startIngest(
   // Failure-tolerant — `extractAndSaveSourceImages` returns [] on
   // any error and logs internally; we never want image extraction
   // to break the ingest chat flow.
-  void extractAndSaveSourceImages(pp, sp, sourceSummarySlug).catch((err) => {
+  void extractSourceImagesOnce(pp, sp, sourceSummarySlug).catch((err) => {
     console.warn(
       `[startIngest:images] eager extraction failed for "${getFileName(sp)}":`,
       err instanceof Error ? err.message : err,
@@ -2266,7 +2346,7 @@ export async function startIngest(
   })
 
   const [sourceContent, schema, purpose, index] = await Promise.all([
-    tryReadFile(sp),
+    tryReadSourceTextFile(sp),
     tryReadFile(`${pp}/wiki/schema.md`),
     tryReadFile(`${pp}/wiki/purpose.md`),
     tryReadFile(`${pp}/wiki/index.md`),
@@ -2474,12 +2554,11 @@ export async function executeIngestWrites(
   // Image cascade: surface any embedded images on the source-summary
   // page. `startIngest` already kicked off extraction in parallel
   // with the chat stream — by now the images are sitting in
-  // `wiki/media/<slug>/`, but no markdown references them yet. We
-  // re-run extraction here to get back the SavedImage metadata
-  // (rel_path, page) needed to build the markdown section. The Rust
-  // command is idempotent (deterministic file paths, overwrite-safe
-  // writes), so repeating it is cheap on the second call where every
-  // file already exists.
+  // `wiki/media/<slug>/`, but no markdown references them yet. Reuse
+  // the eager extraction promise from `startIngest` to get back the
+  // SavedImage metadata (rel_path, page) needed to build the markdown
+  // section. If this write path is reached without a prior startIngest
+  // call, the helper falls back to a single extraction.
   //
   // Read the source path from the chat store — `startIngest` set it
   // there at the beginning of the flow, and we don't have it as a
@@ -2492,10 +2571,17 @@ export async function executeIngestWrites(
   // stays consistent with autoIngest.
   const mmCfgWrites = useWikiStore.getState().multimodalConfig
   if (ingestSource && mmCfgWrites.enabled) {
+    let extractionKey: string | null = null
     try {
       const sourceIdentity = sourceIdentityForPath(pp, ingestSource)
       const sourceSummarySlug = sourceSummarySlugFromIdentity(sourceIdentity)
-      const savedImages = await extractAndSaveSourceImages(pp, ingestSource, sourceSummarySlug)
+      extractionKey = await imageExtractionKey(pp, ingestSource, sourceSummarySlug)
+      const savedImages = await extractSourceImagesOnceByKey(
+        extractionKey,
+        pp,
+        ingestSource,
+        sourceSummarySlug,
+      )
       if (savedImages.length > 0) {
         await injectImagesIntoSourceSummary(pp, sourceIdentity, sourceSummarySlug, savedImages)
       }
@@ -2504,6 +2590,8 @@ export async function executeIngestWrites(
         `[executeIngestWrites:images] post-write injection failed:`,
         err instanceof Error ? err.message : err,
       )
+    } finally {
+      if (extractionKey) ingestImageExtractionPromises.delete(extractionKey)
     }
   }
 

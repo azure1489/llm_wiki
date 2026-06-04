@@ -105,7 +105,8 @@ describe("ingest-queue persistence — write", () => {
     ])
     await waitFor(async () => {
       try {
-        const parsed = JSON.parse(await readQueueFile())
+        const c = await readQueueFile()
+        const parsed = JSON.parse(c)
         return parsed.length === 1
       } catch {
         return false

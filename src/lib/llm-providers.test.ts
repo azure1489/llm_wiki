@@ -106,8 +106,32 @@ describe("Anthropic buildBody — vision content", () => {
     const body = getProviderConfig(cfg).buildBody([
       sys,
       { role: "user", content: "ok" },
-    ]) as { system?: string; messages: unknown[] }
-    expect(body.system).toBe("be terse")
+    ]) as { system?: unknown; messages: unknown[] }
+    expect(body.system).toEqual([
+      {
+        type: "text",
+        text: "be terse",
+        cache_control: { type: "ephemeral" },
+      },
+    ])
+  })
+
+  it("emits Anthropic system prompts as cacheable text blocks", () => {
+    const cfg = mkConfig({ provider: "anthropic", model: "claude-3-5-sonnet-latest" })
+    const body = getProviderConfig(cfg).buildBody([
+      { role: "system", content: "You are helpful." },
+      { role: "system", content: "Prefer concise answers." },
+      { role: "user", content: "Hi" },
+    ]) as { system?: unknown; messages: unknown[] }
+
+    expect(body.system).toEqual([
+      {
+        type: "text",
+        text: "You are helpful.\nPrefer concise answers.",
+        cache_control: { type: "ephemeral" },
+      },
+    ])
+    expect(body.messages).toEqual([{ role: "user", content: "Hi" }])
   })
 })
 
@@ -363,6 +387,62 @@ describe("reasoning controls", () => {
     expect(provider.url).toBe("https://token-plan-cn.xiaomimimo.com/anthropic/v1/messages")
     expect(provider.headers.Authorization).toBe("Bearer sk-mimo")
     expect(provider.headers["x-api-key"]).toBeUndefined()
+    expect(provider.headers["anthropic-version"]).toBe("2023-06-01")
+  })
+
+  it("uses Bearer auth for Kimi Coding Plan Anthropic wire", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      apiKey: "sk-kimi-test",
+      model: "kimi-for-coding",
+      customEndpoint: "https://api.kimi.com/coding/",
+      apiMode: "anthropic_messages",
+    })
+    const provider = getProviderConfig(cfg)
+
+    expect(provider.url).toBe("https://api.kimi.com/coding/v1/messages")
+    expect(provider.headers.Authorization).toBe("Bearer sk-kimi-test")
+    expect(provider.headers["x-api-key"]).toBeUndefined()
+    expect(provider.headers["anthropic-version"]).toBe("2023-06-01")
+  })
+
+  it("uses Bearer auth for Moonshot Anthropic wire", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      apiKey: "sk-moonshot",
+      model: "kimi-k2.6",
+      customEndpoint: "https://api.moonshot.ai/anthropic",
+      apiMode: "anthropic_messages",
+    })
+    const provider = getProviderConfig(cfg)
+
+    expect(provider.url).toBe("https://api.moonshot.ai/anthropic/v1/messages")
+    expect(provider.headers.Authorization).toBe("Bearer sk-moonshot")
+    expect(provider.headers["x-api-key"]).toBeUndefined()
+    expect(provider.headers["anthropic-version"]).toBe("2023-06-01")
+  })
+
+  it("uses cacheable system blocks for custom Anthropic-wire providers", () => {
+    const cfg = mkConfig({
+      provider: "custom",
+      apiKey: "sk-custom",
+      model: "custom-claude",
+      customEndpoint: "https://example.com/anthropic",
+      apiMode: "anthropic_messages",
+    })
+    const body = getProviderConfig(cfg).buildBody([
+      { role: "system", content: "Project-wide instruction." },
+      { role: "user", content: "Hi" },
+    ]) as { system?: unknown; messages: unknown[] }
+
+    expect(body.system).toEqual([
+      {
+        type: "text",
+        text: "Project-wide instruction.",
+        cache_control: { type: "ephemeral" },
+      },
+    ])
+    expect(body.messages).toEqual([{ role: "user", content: "Hi" }])
   })
 
   it("disables Qwen3 thinking on OpenAI-compatible local endpoints", () => {
@@ -404,6 +484,27 @@ describe("reasoning controls", () => {
     ) as Record<string, unknown>
 
     expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 2048 })
+    expect(body.temperature).toBeUndefined()
+  })
+
+  it("keeps cacheable system blocks when Anthropic extended thinking is enabled", () => {
+    const cfg = mkConfig({ provider: "anthropic", model: "claude-sonnet-4-5-20250929" })
+    const body = getProviderConfig(cfg).buildBody(
+      [
+        { role: "system", content: "Persistent project context." },
+        { role: "user", content: "hi" },
+      ],
+      { reasoning: { mode: "low" }, temperature: 0.1, max_tokens: 4096 },
+    ) as Record<string, unknown>
+
+    expect(body.system).toEqual([
+      {
+        type: "text",
+        text: "Persistent project context.",
+        cache_control: { type: "ephemeral" },
+      },
+    ])
+    expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 1024 })
     expect(body.temperature).toBeUndefined()
   })
 

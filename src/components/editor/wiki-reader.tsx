@@ -85,6 +85,30 @@ export function WikiReader({ body }: WikiReaderProps) {
               </a>
             )
           },
+          h1: ({ children, ...props }) => (
+            <h1
+              className="mb-4 mt-0 border-b border-border/60 pb-3 text-3xl font-semibold leading-tight tracking-normal text-foreground"
+              {...props}
+            >
+              {children}
+            </h1>
+          ),
+          h2: ({ children, ...props }) => (
+            <h2
+              className="mb-3 mt-8 border-b border-border/40 pb-2 text-2xl font-semibold leading-tight tracking-normal text-foreground"
+              {...props}
+            >
+              {children}
+            </h2>
+          ),
+          h3: ({ children, ...props }) => (
+            <h3
+              className="mb-2 mt-6 text-xl font-semibold leading-snug tracking-normal text-foreground"
+              {...props}
+            >
+              {children}
+            </h3>
+          ),
           img: ({ src, alt, ...props }) => (
             <img
               src={

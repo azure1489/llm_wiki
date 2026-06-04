@@ -1,6 +1,6 @@
 import { load } from "@tauri-apps/plugin-store"
 import type { WikiProject } from "@/types/wiki"
-import type { ApiConfig, LlmConfig, SearchApiConfig, EmbeddingConfig, MultimodalConfig, OutputLanguage, ProviderConfigs, ProxyConfig, ScheduledImportConfig, SourceWatchConfig } from "@/stores/wiki-store"
+import type { ApiConfig, GeneralConfig, LlmConfig, SearchApiConfig, EmbeddingConfig, MultimodalConfig, OutputLanguage, ProviderConfigs, ProxyConfig, ScheduledImportConfig, SourceWatchConfig } from "@/stores/wiki-store"
 import { normalizeSourceWatchConfig } from "@/lib/source-watch-config"
 import { normalizePath } from "@/lib/path-utils"
 
@@ -157,6 +157,36 @@ export async function loadApiConfig(): Promise<ApiConfig | null> {
   return (await store.get<ApiConfig>(API_CONFIG_KEY)) ?? null
 }
 
+const GENERAL_CONFIG_KEY = "generalConfig"
+
+export const DEFAULT_GENERAL_CONFIG: GeneralConfig = {
+  autostart: false,
+  closeBehavior: "minimize",
+}
+
+export function normalizeGeneralConfig(config?: Partial<GeneralConfig> | null): GeneralConfig {
+  const closeBehavior = config?.closeBehavior
+  return {
+    autostart: typeof config?.autostart === "boolean" ? config.autostart : DEFAULT_GENERAL_CONFIG.autostart,
+    closeBehavior:
+      closeBehavior === "ask" || closeBehavior === "minimize" || closeBehavior === "exit"
+        ? closeBehavior
+        : DEFAULT_GENERAL_CONFIG.closeBehavior,
+  }
+}
+
+export async function saveGeneralConfig(config: GeneralConfig): Promise<void> {
+  const store = await getStore()
+  await store.set(GENERAL_CONFIG_KEY, normalizeGeneralConfig(config))
+  await store.save()
+}
+
+export async function loadGeneralConfig(): Promise<GeneralConfig> {
+  const store = await getStore()
+  const config = await store.get<Partial<GeneralConfig>>(GENERAL_CONFIG_KEY)
+  return normalizeGeneralConfig(config)
+}
+
 const SCHEDULED_IMPORT_KEY_PREFIX = "scheduledImportConfig:"
 
 function scheduledImportKey(projectPath: string): string {
@@ -215,6 +245,18 @@ export async function saveLanguage(lang: string): Promise<void> {
 export async function loadLanguage(): Promise<string | null> {
   const store = await getStore()
   return (await store.get<string>(LANGUAGE_KEY)) ?? null
+}
+
+const THEME_KEY = "theme"
+
+export async function saveTheme(theme: "light" | "dark" | "system"): Promise<void> {
+  const store = await getStore()
+  await store.set(THEME_KEY, theme)
+}
+
+export async function loadTheme(): Promise<"light" | "dark" | "system" | null> {
+  const store = await getStore()
+  return (await store.get<"light" | "dark" | "system">(THEME_KEY)) ?? null
 }
 
 const OUTPUT_LANGUAGE_KEY = "outputLanguage"
