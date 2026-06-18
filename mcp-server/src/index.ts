@@ -7,9 +7,16 @@ import {
   ListToolsRequestSchema,
   McpError,
 } from "@modelcontextprotocol/sdk/types.js"
-import { LlmWikiApiClient, type ApiFileNode, type ApiGraphNode, type ApiSearchResult } from "./api-client.js"
+import {
+  LlmWikiApiClient,
+  type ApiFileNode,
+  type ApiGraphNode,
+  type ApiReviewItem,
+  type ApiReviewsResponse,
+  type ApiSearchResult,
+} from "./api-client.js"
+import { VERSION } from "./version.js"
 
-const VERSION = "0.4.20"
 const DEFAULT_PROJECT_ID = "current"
 const MAX_TEXT_BYTES = 120_000
 
@@ -64,6 +71,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           path: { type: "string", description: "Project-relative file path, for example wiki/index.md." },
         },
         required: ["path"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "llm_wiki_reviews",
+      description: "List Review tab items from a project. Defaults to unresolved items so agent clients can help manage pending wiki review work.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
+          status: { type: "string", enum: ["unresolved", "resolved", "all"], description: "Review status filter. Defaults to unresolved." },
+          type: { type: "string", description: "Optional Review item type filter, for example missing-page, duplicate, contradiction, confirm, or suggestion." },
+          limit: { type: "number", description: "Maximum review items returned. The local API clamps to its configured maximum." },
+        },
         additionalProperties: false,
       },
     },
@@ -139,6 +160,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const relPath = stringArg(args.path, "path")
         const { path, content } = await client.fileContent(projectId(args), relPath)
         return textResult(`# ${path}\n\n${truncateText(content, MAX_TEXT_BYTES)}`)
+      }
+      case "llm_wiki_reviews": {
+        await assertMcpEnabled()
+        const reviews = await client.reviews(projectId(args), {
+          status: enumArg(args.status, ["unresolved", "resolved", "all"] as const, "unresolved"),
+          type: optionalStringArg(args.type),
+          limit: numberArg(args.limit),
+        })
+        return textResult(formatReviews(reviews))
       }
       case "llm_wiki_search": {
         await assertMcpEnabled()
@@ -272,6 +302,43 @@ function formatSearchResults(query: string, search: { results: ApiSearchResult[]
     lines.push("")
   })
   return lines.join("\n")
+}
+
+function formatReviews(response: ApiReviewsResponse): string {
+  const { reviews } = response
+  if (reviews.length === 0) return `No ${response.status} review items found.`
+  const lines = [
+    "# Review items",
+    "",
+    `Status: ${response.status}`,
+    `Count: ${response.count}`,
+    "",
+  ]
+  reviews.forEach((review, index) => {
+    lines.push(`## ${index + 1}. ${review.title || review.id}`)
+    lines.push(`ID: ${review.id}`)
+    lines.push(`Type: ${review.type}`)
+    lines.push(`Resolved: ${review.resolved ? "yes" : "no"}`)
+    if (review.sourcePath) lines.push(`Source: ${review.sourcePath}`)
+    if (review.affectedPages && review.affectedPages.length > 0) {
+      lines.push(`Affected pages: ${review.affectedPages.join(", ")}`)
+    }
+    if (review.searchQueries && review.searchQueries.length > 0) {
+      lines.push(`Search queries: ${review.searchQueries.join(", ")}`)
+    }
+    if (review.description) lines.push(`Description: ${review.description}`)
+    const optionSummary = formatReviewOptions(review)
+    if (optionSummary) lines.push(`Options: ${optionSummary}`)
+    lines.push("")
+  })
+  return lines.join("\n")
+}
+
+function formatReviewOptions(review: ApiReviewItem): string {
+  if (!review.options || review.options.length === 0) return ""
+  return review.options
+    .map((option) => option.label ? `${option.label} (${option.action})` : option.action)
+    .join(", ")
 }
 
 function formatGraph(nodes: ApiGraphNode[], edges: Array<{ source: string; target: string; weight?: number }>): string {

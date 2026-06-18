@@ -77,6 +77,22 @@ function parentPath(path: string): string {
   return index > 0 ? normalized.slice(0, index) : ""
 }
 
+function stripTrailingSlash(path: string): string {
+  return normalizePath(path).replace(/\/+$/, "")
+}
+
+function isSameOrInside(path: string, parent: string): boolean {
+  const p = stripTrailingSlash(path).toLowerCase()
+  const base = stripTrailingSlash(parent).toLowerCase()
+  return p === base || p.startsWith(`${base}/`)
+}
+
+function isProjectScopedImport(projectPath: string, selectedFolder: string): boolean {
+  const pp = stripTrailingSlash(projectPath)
+  const sourceRoot = stripTrailingSlash(selectedFolder)
+  return isSameOrInside(pp, sourceRoot) || isSameOrInside(sourceRoot, pp)
+}
+
 export interface DeleteSourceResult {
   deletedWikiPaths: string[]
   rewrittenSourcePages: number
@@ -181,6 +197,9 @@ export async function importSourceFolder(
 ): Promise<string[]> {
   const pp = normalizePath(project.path)
   const sourceRoot = normalizePath(selectedFolder)
+  if (isProjectScopedImport(pp, sourceRoot)) {
+    throw new Error("Cannot import the project folder or a folder inside the current project.")
+  }
   const folderName = getFileName(selectedFolder) || "imported"
   const destDir = `${pp}/raw/sources/${folderName}`
   const cfg = normalizeSourceWatchConfig(sourceWatchConfig)

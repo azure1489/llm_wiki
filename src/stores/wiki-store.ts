@@ -28,9 +28,17 @@ interface LlmConfig {
   maxContextSize: number // max context window in characters
   apiMode?: CustomApiMode
   reasoning?: ReasoningConfig
+  /**
+   * Local CLI providers only. When true, LLM Wiki asks Claude/Codex CLI
+   * to ignore user-level rules/config/MCP/tool state where the CLI exposes
+   * such controls. Default false preserves existing advanced-user setups.
+   */
+  localCliIsolation?: boolean
+  /** Codex CLI provider only. Overall subprocess timeout in minutes. */
+  codexCliTimeoutMinutes?: number
 }
 
-export type SearchProvider = "tavily" | "serpapi" | "searxng" | "ollama" | "none"
+export type SearchProvider = "tavily" | "serpapi" | "searxng" | "ollama" | "firecrawl" | "none"
 export type DeepResearchSource = "web" | "anytxt" | "both"
 export type SerpApiEngine =
   | "google"
@@ -207,6 +215,14 @@ interface SourceWatchConfig {
   maxFileSizeMb: number
 }
 
+export type MineruModelVersion = "pipeline" | "vlm"
+
+export interface MineruConfig {
+  enabled: boolean
+  token: string
+  modelVersion: MineruModelVersion
+}
+
 interface MultimodalConfig {
   enabled: boolean
   /** Reuse `llmConfig` for caption calls. When true, the fields
@@ -268,6 +284,8 @@ export interface ProviderOverride {
   apiMode?: CustomApiMode
   maxContextSize?: number
   reasoning?: ReasoningConfig
+  localCliIsolation?: boolean
+  codexCliTimeoutMinutes?: number
 }
 
 export type ProviderConfigs = Record<string, ProviderOverride>
@@ -285,6 +303,7 @@ interface WikiState {
   fileTree: FileNode[]
   selectedFile: string | null
   fileContent: string
+  previewContentPath: string | null
   externalPreview: ExternalPreview | null
   /**
    * One-shot scroll target for the markdown preview. When the user
@@ -301,8 +320,7 @@ interface WikiState {
    * one wiki-relative) still works.
    */
   pendingScrollImageSrc: string | null
-  chatExpanded: boolean
-  activeView: "wiki" | "sources" | "search" | "graph" | "lint" | "review" | "settings"
+  activeView: "chat" | "wiki" | "sources" | "search" | "graph" | "lint" | "review" | "settings"
   llmConfig: LlmConfig
   /** Per-provider-preset stored overrides (API key, model, endpoint, …). */
   providerConfigs: ProviderConfigs
@@ -315,6 +333,7 @@ interface WikiState {
   proxyConfig: ProxyConfig
   scheduledImportConfig: ScheduledImportConfig
   sourceWatchConfig: SourceWatchConfig
+  mineruConfig: MineruConfig
   apiConfig: ApiConfig
   generalConfig: GeneralConfig
   dataVersion: number
@@ -323,9 +342,10 @@ interface WikiState {
   setFileTree: (tree: FileNode[]) => void
   setSelectedFile: (path: string | null) => void
   setFileContent: (content: string) => void
+  openPathInPreview: (path: string) => void
+  openFileInPreview: (path: string, content: string) => void
   setExternalPreview: (preview: ExternalPreview | null) => void
   setPendingScrollImageSrc: (src: string | null) => void
-  setChatExpanded: (expanded: boolean) => void
   setActiveView: (view: WikiState["activeView"]) => void
   setLlmConfig: (config: LlmConfig) => void
   setProviderConfigs: (configs: ProviderConfigs) => void
@@ -337,6 +357,7 @@ interface WikiState {
   setProxyConfig: (config: ProxyConfig) => void
   setScheduledImportConfig: (config: ScheduledImportConfig) => void
   setSourceWatchConfig: (config: SourceWatchConfig) => void
+  setMineruConfig: (config: MineruConfig) => void
   setApiConfig: (config: ApiConfig) => void
   setGeneralConfig: (config: GeneralConfig) => void
   bumpDataVersion: () => void
@@ -347,9 +368,9 @@ export const useWikiStore = create<WikiState>((set) => ({
   fileTree: [],
   selectedFile: null,
   fileContent: "",
+  previewContentPath: null,
   externalPreview: null,
   pendingScrollImageSrc: null,
-  chatExpanded: false,
   activeView: "wiki",
   llmConfig: {
     provider: "openai",
@@ -360,6 +381,7 @@ export const useWikiStore = create<WikiState>((set) => ({
     customEndpoint: "",
     azureApiVersion: "2024-10-21",
     reasoning: { mode: "auto" },
+    localCliIsolation: false,
   },
   providerConfigs: {},
   activePresetId: null,
@@ -368,11 +390,21 @@ export const useWikiStore = create<WikiState>((set) => ({
 
   setProject: (project) => set({ project }),
   setFileTree: (fileTree) => set({ fileTree }),
-  setSelectedFile: (selectedFile) => set({ selectedFile, externalPreview: null }),
+  setSelectedFile: (selectedFile) =>
+    set({ selectedFile, previewContentPath: null, externalPreview: null }),
   setFileContent: (fileContent) => set({ fileContent }),
+  openPathInPreview: (selectedFile) =>
+    set({ selectedFile, previewContentPath: null, externalPreview: null, activeView: "wiki" }),
+  openFileInPreview: (selectedFile, fileContent) =>
+    set({
+      selectedFile,
+      fileContent,
+      previewContentPath: selectedFile,
+      externalPreview: null,
+      activeView: "wiki",
+    }),
   setExternalPreview: (externalPreview) => set({ externalPreview }),
   setPendingScrollImageSrc: (pendingScrollImageSrc) => set({ pendingScrollImageSrc }),
-  setChatExpanded: (chatExpanded) => set({ chatExpanded }),
   setActiveView: (activeView) => set({ activeView }),
   searchApiConfig: {
     provider: "none",
@@ -432,6 +464,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   },
 
   sourceWatchConfig: DEFAULT_SOURCE_WATCH_CONFIG,
+  mineruConfig: { enabled: false, token: "", modelVersion: "vlm" },
 
   // Default `enabled: true` preserves the pre-toggle behavior: anyone
   // who already had `LLM_WIKI_API_TOKEN` set or `apiConfig.token`
@@ -460,6 +493,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   setProxyConfig: (proxyConfig) => set({ proxyConfig }),
   setScheduledImportConfig: (scheduledImportConfig) => set({ scheduledImportConfig }),
   setSourceWatchConfig: (sourceWatchConfig) => set({ sourceWatchConfig }),
+  setMineruConfig: (mineruConfig) => set({ mineruConfig }),
   setApiConfig: (apiConfig) => set({ apiConfig }),
   setGeneralConfig: (generalConfig) => set({ generalConfig }),
   bumpDataVersion: () => set((state) => ({ dataVersion: state.dataVersion + 1 })),

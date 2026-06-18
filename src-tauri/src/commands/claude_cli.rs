@@ -17,7 +17,7 @@
 //! capabilities JSON.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +27,8 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+
+use super::cli_resolver::find_cli_command;
 
 /// Shared state holding running `claude` child processes keyed by the
 /// frontend-generated stream id. Registered via .manage() in lib.rs.
@@ -113,18 +115,18 @@ fn claude_content_blocks(content: &ClaudeContent) -> Vec<serde_json::Value> {
     }
 }
 
-fn find_claude_command() -> Result<PathBuf, String> {
+async fn find_claude_command() -> Result<PathBuf, String> {
+    find_cli_command("claude", &["claude.cmd", "claude.exe"]).await
+}
+
+fn suppress_windows_console(_cmd: &mut Command) {
     #[cfg(windows)]
     {
-        if let Ok(path) = which::which("claude.cmd") {
-            return Ok(path);
-        }
-        if let Ok(path) = which::which("claude.exe") {
-            return Ok(path);
-        }
-    }
+        use std::os::windows::process::CommandExt;
 
-    which::which("claude").map_err(|_| "`claude` not found on PATH".to_string())
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        _cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 /// Locate `claude` on PATH and confirm it's runnable by calling
@@ -132,7 +134,7 @@ fn find_claude_command() -> Result<PathBuf, String> {
 /// mount of the settings panel.
 #[tauri::command]
 pub async fn claude_cli_detect() -> Result<DetectResult, String> {
-    let path = match find_claude_command() {
+    let path = match find_claude_command().await {
         Ok(p) => p,
         Err(error) => {
             return Ok(DetectResult {
@@ -146,11 +148,9 @@ pub async fn claude_cli_detect() -> Result<DetectResult, String> {
 
     let path_str = path.to_string_lossy().to_string();
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(3),
-        Command::new(&path).arg("--version").output(),
-    )
-    .await;
+    let mut cmd = Command::new(&path);
+    suppress_windows_console(&mut cmd);
+    let output = tokio::time::timeout(Duration::from_secs(3), cmd.arg("--version").output()).await;
 
     match output {
         Ok(Ok(out)) if out.status.success() => {
@@ -211,6 +211,8 @@ pub async fn claude_cli_spawn(
     stream_id: String,
     model: String,
     messages: Vec<ClaudeMessage>,
+    isolate_local_config: bool,
+    working_directory: Option<String>,
 ) -> Result<(), String> {
     // Build the turn list: fold any system messages into a preamble on
     // the first user turn rather than using a CLI flag, because
@@ -250,16 +252,12 @@ pub async fn claude_cli_spawn(
         })
         .collect();
 
-    let claude = find_claude_command()?;
+    let working_directory = resolve_claude_working_directory(working_directory).await?;
+    let claude = find_claude_command().await?;
     let mut cmd = Command::new(&claude);
-    cmd.arg("-p")
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--input-format")
-        .arg("stream-json")
-        .arg("--verbose")
-        .arg("--model")
-        .arg(&model);
+    suppress_windows_console(&mut cmd);
+    cmd.args(build_claude_cli_args(&model, isolate_local_config));
+    cmd.current_dir(&working_directory);
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -386,6 +384,73 @@ pub async fn claude_cli_spawn(
     Ok(())
 }
 
+fn build_claude_cli_args(model: &str, isolate_local_config: bool) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+    ];
+
+    if isolate_local_config {
+        // Claude has no documented "empty setting sources" mode. Keep the
+        // narrow project source so explicit project-level Claude settings can
+        // still apply, while user/global config, MCP, tools, sessions, and
+        // slash commands are constrained below.
+        args.extend([
+            "--setting-sources".to_string(),
+            "project".to_string(),
+            "--strict-mcp-config".to_string(),
+            "--mcp-config".to_string(),
+            "{}".to_string(),
+            "--disable-slash-commands".to_string(),
+            "--tools".to_string(),
+            "".to_string(),
+            "--no-session-persistence".to_string(),
+            "--prompt-suggestions".to_string(),
+            "false".to_string(),
+        ]);
+    }
+
+    args.extend(["--model".to_string(), model.to_string()]);
+    args
+}
+
+async fn resolve_claude_working_directory(value: Option<String>) -> Result<PathBuf, String> {
+    let raw = value
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Claude Code CLI requires an active project working directory".to_string())?;
+    let path = Path::new(raw.as_str());
+    if !path.is_absolute() {
+        return Err("Claude Code CLI working directory must be an absolute project path".to_string());
+    }
+    let path_meta = tokio::fs::metadata(path).await.map_err(|e| {
+        eprintln!("[claude-cli] failed to read working directory metadata {raw}: {e}");
+        format!("Claude Code CLI working directory does not exist or cannot be read: {raw}")
+    })?;
+    if !path_meta.is_dir() {
+        return Err(format!("Claude Code CLI working directory is not a directory: {raw}"));
+    }
+    let index_path = path.join("wiki").join("index.md");
+    let index_meta = tokio::fs::metadata(&index_path).await.map_err(|e| {
+        eprintln!("[claude-cli] failed to read wiki/index.md metadata for {raw}: {e}");
+        format!("Claude Code CLI working directory must be an LLM Wiki project containing wiki/index.md: {raw}")
+    })?;
+    if !index_meta.is_file() {
+        return Err(format!(
+            "Claude Code CLI working directory must be an LLM Wiki project containing wiki/index.md: {raw}"
+        ));
+    }
+    tokio::fs::canonicalize(path)
+        .await
+        .map_err(|e| format!("Failed to canonicalize Claude Code CLI working directory {raw}: {e}"))
+}
+
 /// Kill a running child registered under `stream_id`. Called on
 /// AbortSignal in the frontend. No-op if the id is unknown (e.g. the
 /// process already exited).
@@ -442,5 +507,91 @@ mod tests {
         .expect("content block payload should deserialize");
 
         assert_eq!(claude_content_text_only(&content), "system rule");
+    }
+
+    #[test]
+    fn claude_args_do_not_isolate_local_config_by_default() {
+        let args = build_claude_cli_args("sonnet", false);
+
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"sonnet".to_string()));
+        assert!(!args.contains(&"--setting-sources".to_string()));
+        assert!(!args.contains(&"--strict-mcp-config".to_string()));
+        assert!(!args.contains(&"--disable-slash-commands".to_string()));
+    }
+
+    #[test]
+    fn claude_args_can_isolate_user_config_tools_and_mcp() {
+        let args = build_claude_cli_args("sonnet", true);
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--setting-sources" && pair[1] == "project"));
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--mcp-config" && pair[1] == "{}"));
+        assert!(args.contains(&"--disable-slash-commands".to_string()));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--tools" && pair[1].is_empty()));
+        assert!(args.contains(&"--no-session-persistence".to_string()));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--prompt-suggestions" && pair[1] == "false"));
+    }
+
+    #[tokio::test]
+    async fn claude_working_directory_requires_llm_wiki_project() {
+        assert!(resolve_claude_working_directory(None)
+            .await
+            .unwrap_err()
+            .contains("active project"));
+        assert!(resolve_claude_working_directory(Some("".to_string()))
+            .await
+            .unwrap_err()
+            .contains("active project"));
+        assert!(resolve_claude_working_directory(Some("   ".to_string()))
+            .await
+            .unwrap_err()
+            .contains("active project"));
+        assert!(resolve_claude_working_directory(Some("relative/path".to_string()))
+            .await
+            .unwrap_err()
+            .contains("absolute"));
+
+        let dir = std::env::temp_dir().join(format!(
+            "llm-wiki-claude-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let raw = dir.to_string_lossy().to_string();
+
+        assert!(resolve_claude_working_directory(Some(raw.clone()))
+            .await
+            .unwrap_err()
+            .contains("wiki/index.md"));
+
+        let wiki_dir = dir.join("wiki");
+        std::fs::create_dir_all(&wiki_dir).expect("wiki dir");
+        let index_dir = wiki_dir.join("index.md");
+        std::fs::create_dir_all(&index_dir).expect("index dir");
+        assert!(resolve_claude_working_directory(Some(raw.clone()))
+            .await
+            .unwrap_err()
+            .contains("wiki/index.md"));
+        std::fs::remove_dir_all(&index_dir).expect("remove index dir");
+        std::fs::write(wiki_dir.join("index.md"), "# Index\n").expect("index");
+
+        let resolved = resolve_claude_working_directory(Some(raw))
+            .await
+            .expect("valid project path");
+        assert_eq!(resolved, dir.canonicalize().expect("canonical tempdir"));
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 }

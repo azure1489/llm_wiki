@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Manager};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 use walkdir::WalkDir;
@@ -21,6 +21,8 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_FILE_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_MAX_FILES: usize = 2_000;
 const HARD_MAX_FILES: usize = 10_000;
+const DEFAULT_MAX_REVIEWS: usize = 200;
+const HARD_MAX_REVIEWS: usize = 1_000;
 const MAX_SEARCH_RESULTS: usize = 50;
 const BIND_RETRY_DELAY_SECS: u64 = 2;
 const MAX_BIND_RETRIES: u32 = 3;
@@ -257,6 +259,9 @@ fn handle_request(
         }
         (&Method::Get, ["projects", project_id, "agent", "page"]) => {
             handle_agent_page(app, project_id, query)
+        }
+        (&Method::Get, ["projects", project_id, "reviews"]) => {
+            handle_reviews(app, project_id, query)
         }
         (&Method::Post, ["projects", project_id, "search"]) => handle_search(app, project_id, body),
         (&Method::Get, ["projects", project_id, "graph"]) => handle_graph(app, project_id, query),
@@ -1195,6 +1200,201 @@ fn relative_to_project(project_path: &str, path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewStatus {
+    Unresolved,
+    Resolved,
+    All,
+}
+
+impl ReviewStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReviewStatus::Unresolved => "unresolved",
+            ReviewStatus::Resolved => "resolved",
+            ReviewStatus::All => "all",
+        }
+    }
+
+    fn matches(self, resolved: bool) -> bool {
+        match self {
+            ReviewStatus::Unresolved => !resolved,
+            ReviewStatus::Resolved => resolved,
+            ReviewStatus::All => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReviewQuery {
+    status: ReviewStatus,
+    item_type: Option<String>,
+    limit: usize,
+}
+
+fn parse_review_query(query: &str) -> Result<ReviewQuery, String> {
+    let params = parse_query(query);
+    let status = match params
+        .get("status")
+        .map(|s| s.as_str())
+        .unwrap_or("unresolved")
+    {
+        "unresolved" | "pending" => ReviewStatus::Unresolved,
+        "resolved" => ReviewStatus::Resolved,
+        "all" => ReviewStatus::All,
+        value => {
+            return Err(format!(
+                "Invalid review status '{value}'. Expected unresolved, resolved, or all"
+            ))
+        }
+    };
+    let item_type = params
+        .get("type")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_REVIEWS)
+        .clamp(1, HARD_MAX_REVIEWS);
+
+    Ok(ReviewQuery {
+        status,
+        item_type,
+        limit,
+    })
+}
+
+fn load_review_items(project_path: &str, query: &ReviewQuery) -> Result<Vec<Value>, String> {
+    let path = Path::new(project_path).join(".llm-wiki/review.json");
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("Failed to read review state: {err}")),
+    };
+    let parsed: Value =
+        serde_json::from_str(&raw).map_err(|err| format!("Invalid review state JSON: {err}"))?;
+    let items = parsed
+        .as_array()
+        .ok_or_else(|| "Invalid review state JSON: expected an array".to_string())?;
+
+    let mut reviews = Vec::new();
+    for item in items {
+        let resolved = item
+            .get("resolved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !query.status.matches(resolved) {
+            continue;
+        }
+        if let Some(item_type) = &query.item_type {
+            if item.get("type").and_then(Value::as_str) != Some(item_type.as_str()) {
+                continue;
+            }
+        }
+        reviews.push(sanitize_review_item(item));
+        if reviews.len() >= query.limit {
+            break;
+        }
+    }
+
+    Ok(reviews)
+}
+
+fn sanitize_review_item(item: &Value) -> Value {
+    let mut out = Map::new();
+    copy_string_field(item, &mut out, "id");
+    copy_string_field(item, &mut out, "type");
+    copy_string_field(item, &mut out, "title");
+    copy_string_field(item, &mut out, "description");
+    copy_string_field(item, &mut out, "sourcePath");
+    copy_string_array_field(item, &mut out, "affectedPages");
+    copy_string_array_field(item, &mut out, "searchQueries");
+    copy_review_options(item, &mut out);
+    copy_bool_field(item, &mut out, "resolved");
+    copy_string_field(item, &mut out, "resolvedAction");
+    copy_number_field(item, &mut out, "createdAt");
+    Value::Object(out)
+}
+
+fn copy_string_field(item: &Value, out: &mut Map<String, Value>, key: &str) {
+    if let Some(value) = item.get(key).and_then(Value::as_str) {
+        out.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn copy_bool_field(item: &Value, out: &mut Map<String, Value>, key: &str) {
+    if let Some(value) = item.get(key).and_then(Value::as_bool) {
+        out.insert(key.to_string(), Value::Bool(value));
+    }
+}
+
+fn copy_number_field(item: &Value, out: &mut Map<String, Value>, key: &str) {
+    if let Some(value) = item.get(key).and_then(Value::as_f64) {
+        if value.is_finite() {
+            out.insert(key.to_string(), json!(value));
+        }
+    }
+}
+
+fn copy_string_array_field(item: &Value, out: &mut Map<String, Value>, key: &str) {
+    let Some(values) = item.get(key).and_then(Value::as_array) else {
+        return;
+    };
+    let strings = values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|value| Value::String(value.to_string()))
+        .collect::<Vec<_>>();
+    out.insert(key.to_string(), Value::Array(strings));
+}
+
+fn copy_review_options(item: &Value, out: &mut Map<String, Value>) {
+    let Some(values) = item.get("options").and_then(Value::as_array) else {
+        return;
+    };
+    let options = values
+        .iter()
+        .filter_map(|option| {
+            let option = option.as_object()?;
+            let mut sanitized = Map::new();
+            if let Some(label) = option.get("label").and_then(Value::as_str) {
+                sanitized.insert("label".to_string(), Value::String(label.to_string()));
+            }
+            if let Some(action) = option.get("action").and_then(Value::as_str) {
+                sanitized.insert("action".to_string(), Value::String(action.to_string()));
+            }
+            if sanitized.is_empty() {
+                None
+            } else {
+                Some(Value::Object(sanitized))
+            }
+        })
+        .collect::<Vec<_>>();
+    out.insert("options".to_string(), Value::Array(options));
+}
+
+fn handle_reviews(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let query = match parse_review_query(query) {
+        Ok(query) => query,
+        Err(e) => return err(400, e),
+    };
+    match load_review_items(&project.path, &query) {
+        Ok(reviews) => ok(json!({
+            "ok": true,
+            "projectId": project.id,
+            "status": query.status.as_str(),
+            "count": reviews.len(),
+            "reviews": reviews,
+        })),
+        Err(e) => err(500, e),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchRequest {
@@ -1566,6 +1766,79 @@ mod tests {
         assert!(is_public_project_rel("Raw/Sources/source.md"));
         assert!(!is_public_project_rel(".llm-wiki/file-change-queue.json"));
         assert!(!is_public_project_rel("wiki/.draft.md"));
+    }
+
+    #[test]
+    fn review_query_defaults_to_unresolved_items() {
+        let root = test_project_dir();
+        let state_dir = root.join(".llm-wiki");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("review.json"),
+            json!([
+                {
+                    "id": "r1",
+                    "type": "missing-page",
+                    "title": "Missing page: Attention",
+                    "description": "Add Attention",
+                    "options": [],
+                    "resolved": false,
+                    "createdAt": 1,
+                    "internalSecret": "do-not-expose"
+                },
+                {
+                    "id": "r2",
+                    "type": "duplicate",
+                    "title": "Duplicate: LLM",
+                    "description": "Merge pages",
+                    "options": [],
+                    "resolved": true,
+                    "createdAt": 2
+                }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        let query = parse_review_query("").unwrap();
+        let reviews = load_review_items(root.to_str().unwrap(), &query).unwrap();
+
+        assert_eq!(query.status.as_str(), "unresolved");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].get("id").and_then(Value::as_str), Some("r1"));
+        assert!(reviews[0].get("internalSecret").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn review_query_filters_by_type_status_and_limit() {
+        let root = test_project_dir();
+        let state_dir = root.join(".llm-wiki");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("review.json"),
+            json!([
+                { "id": "r1", "type": "missing-page", "resolved": false, "createdAt": 1 },
+                { "id": "r2", "type": "missing-page", "resolved": false, "createdAt": 2 },
+                { "id": "r3", "type": "duplicate", "resolved": false, "createdAt": 3 },
+                { "id": "r4", "type": "missing-page", "resolved": true, "createdAt": 4 }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        let query = parse_review_query("status=all&type=missing-page&limit=2").unwrap();
+        let reviews = load_review_items(root.to_str().unwrap(), &query).unwrap();
+
+        assert_eq!(query.status.as_str(), "all");
+        assert_eq!(
+            reviews
+                .iter()
+                .filter_map(|r| r.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["r1", "r2"]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

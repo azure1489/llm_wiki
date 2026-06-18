@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { collectResearchSources } from "./deep-research"
+import { collectResearchSources, makeDeepResearchFileName, noResearchSourcesTaskPatch } from "./deep-research"
 import type { SearchApiConfig } from "@/stores/wiki-store"
 import type { WebSearchResult } from "./web-search"
 
@@ -24,6 +24,47 @@ function config(patch: Partial<SearchApiConfig>): SearchApiConfig {
     ...patch,
   }
 }
+
+describe("makeDeepResearchFileName", () => {
+  it("keeps Unicode topics and includes time to avoid same-day overwrite", () => {
+    const first = makeDeepResearchFileName(
+      "反硝化除磷",
+      new Date("2026-06-06T10:00:00.000Z"),
+    )
+    const second = makeDeepResearchFileName(
+      "反硝化除磷",
+      new Date("2026-06-06T10:00:01.000Z"),
+    )
+
+    expect(first.fileName).toBe("research-反硝化除磷-2026-06-06-100000.md")
+    expect(second.fileName).toBe("research-反硝化除磷-2026-06-06-100001.md")
+    expect(first.fileName).not.toBe(second.fileName)
+  })
+
+  it("uses the local calendar date for frontmatter metadata", () => {
+    const localMorning = new Date(2026, 5, 6, 1, 30, 0)
+
+    expect(makeDeepResearchFileName("政策版本差异", localMorning).date).toBe("2026-06-06")
+  })
+})
+
+describe("noResearchSourcesTaskPatch", () => {
+  it("marks source failures as an error instead of completed", () => {
+    expect(noResearchSourcesTaskPatch(["Firecrawl blocked this IP", "AnyTXT offline"])).toEqual({
+      status: "error",
+      synthesis: "",
+      error: "Firecrawl blocked this IP\nAnyTXT offline",
+    })
+  })
+
+  it("marks an empty successful search as done", () => {
+    expect(noResearchSourcesTaskPatch([])).toEqual({
+      status: "done",
+      synthesis: "No research sources found.",
+      error: null,
+    })
+  })
+})
 
 describe("collectResearchSources", () => {
   it("uses only Web Search when source mode is web", async () => {

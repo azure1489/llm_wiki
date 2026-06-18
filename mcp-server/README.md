@@ -56,6 +56,7 @@ When API unauthenticated mode is enabled, omit `LLM_WIKI_API_TOKEN`. If MCP acce
 - `llm_wiki_projects`: known projects and active project.
 - `llm_wiki_files`: list project files. `project_id` can be a project UUID, a project filesystem path, or `current`.
 - `llm_wiki_read_file`: read an allowed text file such as `wiki/index.md`.
+- `llm_wiki_reviews`: list Review tab items. Defaults to unresolved items and supports `status`, `type`, and `limit` filters.
 - `llm_wiki_search`: search with the app's shared keyword/vector backend.
 - `llm_wiki_graph`: query the app's knowledge graph endpoint.
 - `llm_wiki_rescan_sources`: trigger a Source Watch rescan using the user's configured rules.
@@ -67,6 +68,7 @@ The MCP server inherits the desktop API's security model:
 - It only talks to `127.0.0.1` by default.
 - It uses the same API token or unauthenticated setting as Settings → API + MCP.
 - File reads go through the API path allow-list. Internal app state files are not exposed.
+- Review data is exposed only through the dedicated Review endpoint/tool, which defaults to unresolved items rather than opening internal state files directly.
 - Search and graph tools operate on projects known to the app; use `project_id: "current"` for the active project.
 
 Do not pass API tokens via command-line arguments. Prefer environment variables so they do not appear in shell history.

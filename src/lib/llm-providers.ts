@@ -114,8 +114,27 @@ const JSON_CONTENT_TYPE = "application/json"
  * `src-tauri/Cargo.toml` lets reqwest forward Origin without
  * stripping it. End-to-end our value wins.
  */
-function localLlmOriginHeader(): Record<string, string> {
+export function localLlmOriginHeader(): Record<string, string> {
   return { Origin: "http://localhost" }
+}
+
+export function isLocalOrPrivateHttpEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint)
+    const host = url.hostname.toLowerCase()
+    if (host === "localhost" || host.endsWith(".localhost")) return true
+    if (host === "127.0.0.1" || host === "::1" || host === "[::1]") return true
+    if (/^10\./.test(host)) return true
+    if (/^192\.168\./.test(host)) return true
+    const m = host.match(/^172\.(\d+)\./)
+    if (m) {
+      const second = Number(m[1])
+      if (second >= 16 && second <= 31) return true
+    }
+    return false
+  } catch {
+    return false
+  }
 }
 
 function parseOpenAiLine(line: string): string | null {
@@ -263,6 +282,10 @@ function isDeepSeekEndpoint(config: LlmConfig): boolean {
   return /deepseek/i.test(config.model) || /deepseek/i.test(config.customEndpoint)
 }
 
+function supportsDeepSeekThinkingParam(config: LlmConfig): boolean {
+  return /deepseek[-_]?v4/i.test(config.model)
+}
+
 function isQwenThinkingModel(model: string): boolean {
   return /qwen[-_]?3/i.test(model)
 }
@@ -276,6 +299,18 @@ function isKimiEndpoint(config: LlmConfig): boolean {
 function isXiaomiMimoEndpoint(config: LlmConfig): boolean {
   return /(^|[/:.-])mimo([/:.-]|$)/i.test(config.model)
     || /\.?xiaomimimo\.com(?::|\/|$)/i.test(config.customEndpoint)
+}
+
+function isBigModelEndpoint(config: LlmConfig): boolean {
+  return /(?:^|\/\/)open\.bigmodel\.cn(?:[:/]|$)/i.test(config.customEndpoint)
+}
+
+function isGlmVisionModel(model: string): boolean {
+  const normalized = model.trim().toLowerCase()
+  return /(?:^|[-_.])glm[-_.]5v[-_.]turbo(?:[-_.]|$)/i.test(normalized)
+    || /(?:^|[-_.])glm[-_.]4\.?6v(?:[-_.]|$)/i.test(normalized)
+    || /(?:^|[-_.])glm[-_.]4\.?5v(?:[-_.]|$)/i.test(normalized)
+    || /(?:^|[-_.])glm[-_.]4v(?:[-_.]|$)/i.test(normalized)
 }
 
 function isOpenAiStrictCompletionModel(config: LlmConfig): boolean {
@@ -353,6 +388,7 @@ function buildOpenAiCompatibleBody(
   messages: ChatMessage[],
   overrides?: RequestOverrides,
 ): Record<string, unknown> {
+  assertBigModelImageSupport(config, messages)
   const reasoning = effectiveReasoning(config, overrides)
   const body: Record<string, unknown> = buildOpenAiBody(messages, stripWireAgnosticOverrides(overrides))
   adaptOpenAiStrictCompletionBody(config, body)
@@ -364,13 +400,43 @@ function buildOpenAiCompatibleBody(
     // important path for ingestion/rewrite tasks: it prevents the model
     // from spending the whole response on `reasoning_content` with no
     // final `content`.
-    if (reasoning.mode === "off") {
-      body.thinking = { type: "disabled" }
-    } else if (reasoning.mode !== "auto") {
-      body.thinking = { type: "enabled" }
-      if (reasoning.mode === "high" || reasoning.mode === "max") {
-        body.reasoning_effort = reasoning.mode
+    if (supportsDeepSeekThinkingParam(config)) {
+      if (reasoning.mode === "off") {
+        body.thinking = { type: "disabled" }
+      } else if (reasoning.mode !== "auto") {
+        body.thinking = { type: "enabled" }
+        if (reasoning.mode === "high" || reasoning.mode === "max") {
+          body.reasoning_effort = reasoning.mode
+        }
       }
+    }
+    return body
+  }
+
+  if (config.provider === "ollama") {
+    // Ollama's OpenAI-compatible /v1/chat/completions maps reasoning
+    // control onto `reasoning_effort` ("high"|"medium"|"low"|"none";
+    // "none" disables thinking). This is the only lever that stops a
+    // thinking-capable model — or a non-thinking one Ollama wraps with a
+    // thinking template — from spending its entire token budget on
+    // chain-of-thought and ending the stream with an empty `content`,
+    // which surfaces to the user as the "produced N chars of reasoning,
+    // but no actual response content" diagnostic. Until this, callers'
+    // `reasoning: { mode: "off" }` (every structured ingest call) was
+    // silently dropped on the Ollama path. Non-thinking models (gemma,
+    // llama) ignore the field harmlessly. "max" has no Ollama analogue,
+    // so it maps to the strongest supported level, "high".
+    // See docs.ollama.com/api/openai-compatibility.
+    if (reasoning.mode === "off") {
+      body.reasoning_effort = "none"
+    } else if (
+      reasoning.mode === "low" ||
+      reasoning.mode === "medium" ||
+      reasoning.mode === "high"
+    ) {
+      body.reasoning_effort = reasoning.mode
+    } else if (reasoning.mode === "max") {
+      body.reasoning_effort = "high"
     }
     return body
   }
@@ -503,6 +569,12 @@ function buildAnthropicBodyWithReasoning(
   return body
 }
 
+function hasImageContent(messages: ChatMessage[]): boolean {
+  return messages.some((m) =>
+    Array.isArray(m.content) && m.content.some((block) => block.type === "image"),
+  )
+}
+
 /**
  * Some Anthropic-compatible third-party endpoints (MiniMax global + CN)
  * serve the Messages API but authenticate with `Authorization: Bearer`
@@ -539,6 +611,73 @@ function requiresBearerAuth(url: string): boolean {
   )
 }
 
+function isMiniMaxAnthropicHost(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    return parsed.hostname === "api.minimax.io" || parsed.hostname === "api.minimaxi.com"
+  } catch {
+    return false
+  }
+}
+
+function normalizeMiniMaxAnthropicBase(base: string): string {
+  if (!isMiniMaxAnthropicHost(base)) return base
+
+  try {
+    const parsed = new URL(base)
+    const path = parsed.pathname.replace(/\/+$/, "")
+    if (path === "" || path === "/" || /^\/v\d+(?:\/messages)?$/i.test(path)) {
+      parsed.pathname = "/anthropic"
+      parsed.search = ""
+      parsed.hash = ""
+      return parsed.toString().replace(/\/+$/, "")
+    }
+  } catch {
+    return base
+  }
+
+  return base
+}
+
+function isOfficialMiniMaxAnthropicUrl(url: string): boolean {
+  if (!isMiniMaxAnthropicHost(url)) return false
+  try {
+    const parsed = new URL(url)
+    return /^\/anthropic(?:\/|$)/i.test(parsed.pathname)
+  } catch {
+    return false
+  }
+}
+
+function isMiniMaxM3Model(model: string): boolean {
+  return /^minimax-m3(?:[-_.]|$)/i.test(model.trim())
+}
+
+function assertMiniMaxImageSupport(url: string, model: string, messages: ChatMessage[]): void {
+  if (!isOfficialMiniMaxAnthropicUrl(url) || !hasImageContent(messages) || isMiniMaxM3Model(model)) return
+  throw new Error(
+    "MiniMax image input is supported only by MiniMax-M3 on the official Anthropic-compatible endpoint. Switch the model to MiniMax-M3 or use another vision-capable provider.",
+  )
+}
+
+function assertBigModelImageSupport(config: LlmConfig, messages: ChatMessage[]): void {
+  if (!isBigModelEndpoint(config) || !hasImageContent(messages) || isGlmVisionModel(config.model)) return
+  throw new Error(
+    "Zhipu BigModel image input is supported only by GLM vision models. Switch to glm-5v-turbo, glm-4.6v, glm-4.5v, or glm-4v-plus.",
+  )
+}
+
+export function supportsImageInput(config: LlmConfig): boolean {
+  if (config.provider === "codex-cli") return false
+  if (config.provider === "minimax") return isMiniMaxM3Model(config.model)
+  if (isBigModelEndpoint(config)) return isGlmVisionModel(config.model)
+  if ((config.provider === "custom") && (config.apiMode ?? "chat_completions") === "anthropic_messages") {
+    const url = buildAnthropicUrl(config.customEndpoint)
+    return !isOfficialMiniMaxAnthropicUrl(url) || isMiniMaxM3Model(config.model)
+  }
+  return true
+}
+
 /**
  * Build the final POST URL for an Anthropic-wire endpoint given whatever
  * base the user provided. Handles every shape we've seen in the wild:
@@ -553,7 +692,7 @@ function requiresBearerAuth(url: string): boolean {
  * ".../v1/v1/messages" (404) whenever a user typed a URL ending in /v1.
  */
 export function buildAnthropicUrl(base: string): string {
-  const trimmed = base.replace(/\/+$/, "")
+  const trimmed = normalizeMiniMaxAnthropicBase(base).replace(/\/+$/, "")
   if (/\/v\d+\/messages$/i.test(trimmed)) return trimmed
   if (/\/v\d+$/i.test(trimmed)) return `${trimmed}/messages`
   return `${trimmed}/v1/messages`
@@ -682,10 +821,13 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
       return {
         url,
         headers: buildAnthropicHeaders(apiKey, url),
-        buildBody: (messages, overrides) => ({
-          ...buildAnthropicBodyWithReasoning(config, messages, overrides),
-          model,
-        }),
+        buildBody: (messages, overrides) => {
+          assertMiniMaxImageSupport(url, model, messages)
+          return {
+            ...buildAnthropicBodyWithReasoning(config, messages, overrides),
+            model,
+          }
+        },
         parseStream: parseAnthropicLine,
       }
     }
@@ -762,10 +904,13 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
       return {
         url,
         headers: buildAnthropicHeaders(apiKey, url),
-        buildBody: (messages, overrides) => ({
-          ...buildAnthropicBodyWithReasoning(config, messages, overrides),
-          model,
-        }),
+        buildBody: (messages, overrides) => {
+          assertMiniMaxImageSupport(url, model, messages)
+          return {
+            ...buildAnthropicBodyWithReasoning(config, messages, overrides),
+            model,
+          }
+        },
         parseStream: parseAnthropicLine,
       }
     }
@@ -791,10 +936,13 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
         return {
           url,
           headers: buildAnthropicHeaders(apiKey, url),
-          buildBody: (messages, overrides) => ({
-            ...buildAnthropicBodyWithReasoning(config, messages, overrides),
-            model,
-          }),
+          buildBody: (messages, overrides) => {
+            assertMiniMaxImageSupport(url, model, messages)
+            return {
+              ...buildAnthropicBodyWithReasoning(config, messages, overrides),
+              model,
+            }
+          },
           parseStream: parseAnthropicLine,
         }
       }
@@ -822,10 +970,11 @@ export function getProviderConfig(config: LlmConfig): ProviderConfig {
               ? { "api-key": apiKey }
               : { Authorization: `Bearer ${apiKey}` }
             : {}),
-          // Local OpenAI-compatible servers (LM Studio, llama.cpp,
-          // vLLM, LocalAI) often share Ollama's CORS sensitivity.
-          // Same rationale as the `ollama` branch above.
-          ...(azure ? {} : localLlmOriginHeader()),
+          // Only local/LAN OpenAI-compatible servers (LM Studio,
+          // llama.cpp, vLLM, LocalAI) need the Ollama-style Origin
+          // workaround. Public custom gateways may reject unexpected
+          // browser Origin headers, so leave them untouched.
+          ...(!azure && isLocalOrPrivateHttpEndpoint(url) ? localLlmOriginHeader() : {}),
         },
         buildBody: (messages, overrides) => {
           const body = buildOpenAiCompatibleBody(config, messages, overrides)

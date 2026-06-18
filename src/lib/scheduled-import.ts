@@ -20,6 +20,7 @@ import {
   enqueueSourceIngest,
   isIngestableSourcePath,
 } from "@/lib/source-lifecycle"
+import { useActivityStore } from "@/stores/activity-store"
 
 interface ImportDb {
   files: Record<string, string>
@@ -48,6 +49,7 @@ const EMPTY_DB: ImportDb = {
 let scanTimer: ReturnType<typeof setInterval> | null = null
 let scanning = false
 let activeRunId = 0
+const managedPathWarningKeys = new Set<string>()
 
 const DB_PATH = ".llm-wiki/scheduled-import-db.json"
 const LEGACY_DB_DIR = ".llm-wiki-imported"
@@ -112,6 +114,35 @@ function isPathInside(path: string, parent: string): boolean {
 
 function projectSubpath(projectPath: string, relPath: string): string {
   return `${normalizePath(projectPath)}/${relPath}`
+}
+
+export function isProjectManagedScheduledImportPath(
+  projectPath: string,
+  importPath: string,
+): boolean {
+  const project = normalizePath(projectPath).replace(/\/+$/, "")
+  const root = normalizePath(importPath).replace(/\/+$/, "")
+  return (
+    root === project ||
+    isPathInside(project, root) ||
+    isPathInside(root, projectSubpath(project, "raw")) ||
+    isPathInside(root, projectSubpath(project, "raw/sources")) ||
+    isPathInside(root, projectSubpath(project, "wiki")) ||
+    isPathInside(root, projectSubpath(project, ".llm-wiki"))
+  )
+}
+
+function notifyManagedScheduledImportPath(project: WikiProject, importRoot: string): void {
+  const key = `${project.id}:${normalizePath(importRoot)}`
+  if (managedPathWarningKeys.has(key)) return
+  managedPathWarningKeys.add(key)
+  useActivityStore.getState().addItem({
+    type: "ingest",
+    title: "Scheduled import skipped",
+    status: "error",
+    detail: `Scheduled import path is inside or contains the current LLM Wiki project: ${importRoot}. Choose an external folder; project sources are handled by source folder monitoring.`,
+    filesWritten: [],
+  })
 }
 
 function stableSuffix(input: string): string {
@@ -301,11 +332,21 @@ export async function scanAndImport(
   importPath: string,
   options: ScanOptions = {},
 ): Promise<void> {
-  if (!importPath || scanning) return
+  if (!importPath) return
 
-  scanning = true
   const projectPath = normalizePath(project.path)
   const importRoot = resolveImportPath(projectPath, importPath)
+  if (isProjectManagedScheduledImportPath(projectPath, importRoot)) {
+    console.warn(
+      `[scheduled-import] skipped self-referential path "${importRoot}". Use source folder monitoring for project sources instead.`,
+    )
+    notifyManagedScheduledImportPath(project, importRoot)
+    return
+  }
+
+  if (scanning) return
+
+  scanning = true
 
   try {
     if (!isCurrentRun(project.id, options.runId)) {

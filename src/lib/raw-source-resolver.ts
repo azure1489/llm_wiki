@@ -22,7 +22,7 @@
 import { listDirectory } from "@/commands/fs"
 import {
   sourceIdentityForPath,
-  sourceSummarySlugFromIdentity,
+  sourceSummarySlugCandidatesFromIdentity,
 } from "@/lib/source-identity"
 import type { FileNode } from "@/types/wiki"
 
@@ -56,7 +56,7 @@ export async function findRawSourceForImage(
         continue
       }
       const identity = sourceIdentityForPath(normalizedProjectPath, node.path)
-      if (sourceSummarySlugFromIdentity(identity) === slug) return node.path
+      if (sourceSummarySlugCandidatesFromIdentity(identity).includes(slug)) return node.path
 
       // Backward compatibility for media folders created before nested source
       // identities were encoded into the slug.

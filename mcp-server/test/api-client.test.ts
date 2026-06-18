@@ -100,6 +100,41 @@ test("files exposes truncated flag", async () => {
   assert.equal(files.files[0]?.path, "wiki/index.md")
 })
 
+test("reviews requests unresolved review items with filters", async () => {
+  const calls: string[] = []
+  const fetchImpl = async (url: string | URL | Request): Promise<Response> => {
+    calls.push(String(url))
+    return new Response(JSON.stringify({
+      ok: true,
+      projectId: "p1",
+      status: "unresolved",
+      count: 1,
+      reviews: [{
+        id: "r1",
+        type: "missing-page",
+        title: "Missing page: Attention",
+        description: "Add the Attention page",
+        options: [],
+        resolved: false,
+        createdAt: 1,
+      }],
+    }), { status: 200 })
+  }
+
+  const client = new LlmWikiApiClient({ baseUrl: "http://localhost:19828", fetchImpl })
+  const result = await client.reviews("current", {
+    status: "unresolved",
+    type: "missing-page",
+    limit: 5,
+  })
+
+  assert.equal(calls[0], "http://localhost:19828/api/v1/projects/current/reviews?status=unresolved&type=missing-page&limit=5")
+  assert.equal(result.status, "unresolved")
+  assert.equal(result.count, 1)
+  assert.equal(result.reviews[0]?.id, "r1")
+  assert.equal(result.reviews[0]?.resolved, false)
+})
+
 test("network failures include desktop app hint", async () => {
   const fetchImpl = async (): Promise<Response> => {
     throw new Error("ECONNREFUSED")

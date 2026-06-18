@@ -4,15 +4,16 @@ import { BookOpen, Plus, Trash2, MessageSquare } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ChatMessage, StreamingMessage, useSourceFiles } from "./chat-message"
 import { ChatInput, type ChatSendOptions } from "./chat-input"
-import { useChatStore, chatMessagesToLLM, type MessageReference } from "@/stores/chat-store"
+import { useChatStore, chatMessagesToLLM, type MessageReference, type MessageImage } from "@/stores/chat-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { streamChat, type ChatMessage as LLMMessage } from "@/lib/llm-client"
+import { supportsImageInput } from "@/lib/llm-providers"
 import { executeIngestWrites } from "@/lib/ingest"
 import { listDirectory, readFile, deleteFile } from "@/commands/fs"
 import { searchWiki } from "@/lib/search"
 import { buildRetrievalGraph, getRelatedNodes } from "@/lib/graph-relevance"
 import { normalizePath, getFileName, getRelativePath } from "@/lib/path-utils"
-import { getOutputLanguage, buildLanguageReminder } from "@/lib/output-language"
+import { buildLanguageDirective, buildLanguageReminder } from "@/lib/output-language"
 import { isGreeting } from "@/lib/greeting-detector"
 import { computeContextBudget } from "@/lib/context-budget"
 import { anyTxtSearchSmart, hasConfiguredAnyTxt } from "@/lib/anytxt-search"
@@ -160,6 +161,7 @@ export function ChatPanel() {
   const llmConfig = useWikiStore((s) => s.llmConfig)
   const searchApiConfig = useWikiStore((s) => s.searchApiConfig)
   const anyTxtAvailable = hasConfiguredAnyTxt(searchApiConfig.anyTxt)
+  const imageInputAvailable = supportsImageInput(llmConfig)
   const setFileTree = useWikiStore((s) => s.setFileTree)
 
   const abortRef = useRef<AbortController | null>(null)
@@ -175,14 +177,18 @@ export function ChatPanel() {
   }, [activeMessages, streamingContent])
 
   const handleSend = useCallback(
-    async (text: string, options: ChatSendOptions = { useWebSearch: false, useAnyTxtSearch: false }) => {
+    async (
+      text: string,
+      images: MessageImage[] = [],
+      options: ChatSendOptions = { useWebSearch: false, useAnyTxtSearch: false },
+    ) => {
       // Auto-create a conversation if none is active
       let convId = useChatStore.getState().activeConversationId
       if (!convId) {
         convId = createConversation()
       }
 
-      addMessage("user", text)
+      addMessage("user", text, images)
       setStreaming(true)
 
       // Build system prompt with wiki context using graph-enhanced retrieval
@@ -195,7 +201,6 @@ export function ChatPanel() {
       // minimal system prompt and let the model reply conversationally.
       const greetingOnly = isGreeting(text)
       if (project && greetingOnly) {
-        const outLang = getOutputLanguage(text)
         systemMessages.push({
           role: "system",
           content: [
@@ -203,7 +208,7 @@ export function ChatPanel() {
             "The user sent a casual greeting — reply briefly and naturally, in one or two sentences.",
             "Do NOT invent wiki content or pretend to have retrieved pages. Invite the user to ask a concrete question if they want information from the wiki.",
             "",
-            `Respond in ${outLang}.`,
+            buildLanguageReminder(text),
           ].join("\n"),
         })
         // Skip retrieval; queryRefs stays empty so no "Sources" chip is shown.
@@ -366,8 +371,6 @@ export function ChatPanel() {
         ).join("\n")
         const externalContext = formatExternalSearchContext(externalSearchResults)
 
-        const outLang = getOutputLanguage(text)
-
         systemMessages.push({
           role: "system",
           content: [
@@ -378,6 +381,8 @@ export function ChatPanel() {
               ? "- Answer based ONLY on the numbered wiki pages and external sources provided below."
               : "- Answer based ONLY on the numbered wiki pages provided below.",
             "- If the provided pages don't contain enough information, say so honestly.",
+            "- Keep subject boundaries strict: do not apply a claim, limitation, evaluation, benchmark result, or recommendation about one entity/model/product/method to another subject just because they share keywords.",
+            "- If pages or external sources discuss multiple subjects, attribute each claim to the exact subject named in that page or source; when uncertain, state the uncertainty instead of generalizing.",
             "- Use [[wikilink]] syntax to reference wiki pages.",
             externalContext
               ? "- When citing wiki information, use page numbers like [1], [2]. When citing external information, use external source IDs like [E1], [E2]."
@@ -398,13 +403,7 @@ export function ChatPanel() {
             "",
             "---",
             "",
-            `## ⚠️ MANDATORY OUTPUT LANGUAGE: ${outLang}`,
-            "",
-            `You MUST write your entire response in **${outLang}**.`,
-            `The wiki content above may be in a different language, but this is IRRELEVANT to your output language.`,
-            `Ignore the language of the wiki content. Write in ${outLang} only.`,
-            `Even proper nouns should use standard ${outLang} transliteration when appropriate.`,
-            `DO NOT use any other language. This overrides all other instructions.`,
+            buildLanguageDirective(text),
           ].filter(Boolean).join("\n"),
         })
 
@@ -444,9 +443,31 @@ export function ChatPanel() {
         const lastIdx = llmMessages.length - 1
         const last = llmMessages[lastIdx]
         if (last && last.role === "user") {
+          // The final user turn may now be either a plain string
+          // (text-only) or a ContentBlock[] (carries images). Prepend
+          // the language reminder to the textual part in both shapes —
+          // string-concat for the legacy form, and into the first text
+          // block (or a new leading text block) for the multimodal form.
+          const prefix = `[${langReminder}]\n\n`
+          let newContent: LLMMessage["content"]
+          if (typeof last.content === "string") {
+            newContent = `${prefix}${last.content}`
+          } else {
+            const blocks = [...last.content]
+            const firstTextIdx = blocks.findIndex((b) => b.type === "text")
+            if (firstTextIdx >= 0) {
+              const tb = blocks[firstTextIdx]
+              if (tb.type === "text") {
+                blocks[firstTextIdx] = { type: "text", text: `${prefix}${tb.text}` }
+              }
+            } else {
+              blocks.unshift({ type: "text", text: prefix })
+            }
+            newContent = blocks
+          }
           llmMessages = [
             ...llmMessages.slice(0, lastIdx),
-            { role: "user", content: `[${langReminder}]\n\n${last.content}` },
+            { role: "user", content: newContent },
           ]
         }
       }
@@ -529,7 +550,9 @@ export function ChatPanel() {
         messages: s.messages.filter((m) => m.id !== lastUser.id),
       }))
     }
-    handleSend(lastUserMsg.content)
+    // Re-send with the original text AND images so a regenerated turn
+    // keeps the same vision context.
+    handleSend(lastUserMsg.content, lastUserMsg.images ?? [])
   }, [isStreaming, removeLastAssistantMessage, handleSend])
 
   const handleWriteToWiki = useCallback(async () => {
@@ -610,6 +633,7 @@ export function ChatPanel() {
           onStop={handleStop}
           isStreaming={isStreaming}
           anyTxtAvailable={anyTxtAvailable}
+          imageInputAvailable={imageInputAvailable}
           placeholder={
             mode === "ingest"
               ? t("chat.ingestPlaceholder")

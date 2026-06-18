@@ -181,6 +181,10 @@ pub fn run() {
             app.manage(commands::codex_cli::CodexCliState::default());
             app.manage(commands::file_sync::FileSyncState::default());
             app.manage(CloseBehaviorState(Mutex::new("minimize".to_string())));
+            app.manage(TrayAvailabilityState(Mutex::new(false)));
+            // Start the API before optional desktop integrations so the
+            // backend is reachable if tray setup or another integration fails.
+            api_server::start_api_server(app.handle().clone());
             let tray_available = match tray::create_tray(app.handle()) {
                 Ok(()) => true,
                 Err(err) => {
@@ -188,13 +192,20 @@ pub fn run() {
                     false
                 }
             };
-            app.manage(TrayAvailabilityState(Mutex::new(tray_available)));
-            api_server::start_api_server(app.handle().clone());
+            match app.state::<TrayAvailabilityState>().0.lock() {
+                Ok(mut state) => {
+                    *state = tray_available;
+                }
+                Err(err) => {
+                    eprintln!("[tray] failed to update tray availability state: {err}");
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::fs::read_file,
             commands::fs::write_file,
+            commands::fs::write_file_base64,
             commands::fs::write_file_atomic,
             commands::fs::list_directory,
             commands::fs::copy_file,
@@ -224,6 +235,8 @@ pub fn run() {
             commands::vectorstore::vector_search_chunks,
             commands::vectorstore::vector_delete_page,
             commands::vectorstore::vector_count_chunks,
+            commands::vectorstore::vector_clear_chunks,
+            commands::vectorstore::vector_optimize_chunks,
             commands::vectorstore::vector_legacy_row_count,
             commands::vectorstore::vector_drop_legacy,
             commands::claude_cli::claude_cli_detect,

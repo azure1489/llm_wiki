@@ -52,6 +52,34 @@ export interface ApiGraphEdge {
   weight?: number
 }
 
+export type ApiReviewStatus = "unresolved" | "resolved" | "all"
+
+export interface ApiReviewOption {
+  label: string
+  action: string
+}
+
+export interface ApiReviewItem {
+  id: string
+  type: string
+  title: string
+  description: string
+  sourcePath?: string
+  affectedPages?: string[]
+  searchQueries?: string[]
+  options: ApiReviewOption[]
+  resolved: boolean
+  resolvedAction?: string
+  createdAt: number
+}
+
+export interface ApiReviewsResponse {
+  projectId?: string
+  status: ApiReviewStatus
+  count: number
+  reviews: ApiReviewItem[]
+}
+
 export interface ApiFilesResponse {
   files: ApiFileNode[]
   truncated?: boolean
@@ -129,6 +157,22 @@ export class LlmWikiApiClient {
     return {
       path: typeof json.path === "string" ? json.path : path,
       content: typeof json.content === "string" ? json.content : "",
+    }
+  }
+
+  async reviews(projectId = "current", options: { status?: ApiReviewStatus; type?: string; limit?: number } = {}): Promise<ApiReviewsResponse> {
+    const params = new URLSearchParams()
+    if (options.status) params.set("status", options.status)
+    if (options.type) params.set("type", options.type)
+    if (options.limit !== undefined) params.set("limit", String(options.limit))
+    const suffix = params.toString() ? `?${params.toString()}` : ""
+    const json = await this.request(`/projects/${encodeURIComponent(projectId)}/reviews${suffix}`)
+    const reviews = Array.isArray(json.reviews) ? json.reviews.map(parseReviewItem) : []
+    return {
+      projectId: typeof json.projectId === "string" ? json.projectId : undefined,
+      status: parseReviewStatus(json.status),
+      count: numberOrUndefined(json.count) ?? reviews.length,
+      reviews,
     }
   }
 
@@ -237,6 +281,35 @@ function parseSearchResult(value: unknown): ApiSearchResult {
       return { url: String(item.url ?? ""), alt: String(item.alt ?? "") }
     }) : [],
     vectorScore: numberOrUndefined(obj.vectorScore) ?? null,
+  }
+}
+
+function parseReviewStatus(value: unknown): ApiReviewStatus {
+  return value === "resolved" || value === "all" ? value : "unresolved"
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value.map((item) => String(item))
+}
+
+function parseReviewItem(value: unknown): ApiReviewItem {
+  const obj = requireObject(value, "review item")
+  return {
+    id: String(obj.id ?? ""),
+    type: String(obj.type ?? ""),
+    title: String(obj.title ?? ""),
+    description: String(obj.description ?? ""),
+    sourcePath: typeof obj.sourcePath === "string" ? obj.sourcePath : undefined,
+    affectedPages: stringArray(obj.affectedPages),
+    searchQueries: stringArray(obj.searchQueries),
+    options: Array.isArray(obj.options) ? obj.options.map((option) => {
+      const item = requireObject(option, "review option")
+      return { label: String(item.label ?? ""), action: String(item.action ?? "") }
+    }) : [],
+    resolved: obj.resolved === true,
+    resolvedAction: typeof obj.resolvedAction === "string" ? obj.resolvedAction : undefined,
+    createdAt: numberOrUndefined(obj.createdAt) ?? 0,
   }
 }
 

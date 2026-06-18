@@ -10,6 +10,7 @@ import {
   BrainCircuit,
   Wrench,
   Trash2,
+  Link,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -19,6 +20,11 @@ import { runStructuralLint, runSemanticLint } from "@/lib/lint"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
 import { readFile, writeFile, listDirectory } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
+import {
+  appendWikilink,
+  ensureBrokenLinkStub,
+  rewriteWikilinkTarget,
+} from "@/lib/lint-fixes"
 import { useTranslation } from "react-i18next"
 
 export function groupLintResultsForDisplay(results: readonly LintItem[]): {
@@ -47,9 +53,7 @@ export function LintView() {
   const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const llmConfig = useWikiStore((s) => s.llmConfig)
-  const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
-  const setFileContent = useWikiStore((s) => s.setFileContent)
-  const setActiveView = useWikiStore((s) => s.setActiveView)
+  const openFileInPreview = useWikiStore((s) => s.openFileInPreview)
   const setFileTree = useWikiStore((s) => s.setFileTree)
   const bumpDataVersion = useWikiStore((s) => s.bumpDataVersion)
 
@@ -69,11 +73,13 @@ export function LintView() {
   const [hasRun, setHasRun] = useState(false)
   const [runSemantic, setRunSemantic] = useState(false)
   const [fixingId, setFixingId] = useState<string | null>(null)
+  const [fixError, setFixError] = useState<string | null>(null)
 
   const handleRunLint = useCallback(async () => {
     if (!project || running) return
     const pp = normalizePath(project.path)
     setRunning(true)
+    setFixError(null)
     clearLintItems()
     try {
       const structural = await runStructuralLint(pp)
@@ -100,75 +106,90 @@ export function LintView() {
       `${pp}/wiki/${page}`,
       `${pp}/wiki/${page}.md`,
     ]
-    setActiveView("wiki")
     for (const path of candidates) {
       try {
         const content = await readFile(path)
-        setSelectedFile(path)
-        setFileContent(content)
+        openFileInPreview(path, content)
         return
       } catch {
         // try next
       }
     }
-    setSelectedFile(candidates[0])
-    setFileContent(`Unable to load: ${page}`)
+    openFileInPreview(candidates[0], `Unable to load: ${page}`)
   }
 
   async function handleFix(item: LintItem) {
     if (!project) return
     const pp = normalizePath(project.path)
     setFixingId(item.id)
+    setFixError(null)
 
     try {
       switch (item.type) {
         case "orphan": {
-          // Add a link to this page from index.md
-          const indexPath = `${pp}/wiki/index.md`
-          let indexContent = ""
-          try { indexContent = await readFile(indexPath) } catch { indexContent = "# Wiki Index\n" }
-
-          const pageName = item.page.replace(".md", "").replace(/^.*\//, "")
-          const entry = `- [[${pageName}]]`
-          if (!indexContent.includes(entry)) {
-            indexContent = indexContent.trimEnd() + "\n" + entry + "\n"
-            await writeFile(indexPath, indexContent)
+          if (item.suggestedSource) {
+            const sourcePath = `${pp}/wiki/${item.suggestedSource}`
+            const content = await readFile(sourcePath)
+            await writeFile(sourcePath, appendWikilink(content, item.page))
+          } else {
+            useReviewStore.getState().addItem({
+              type: "suggestion",
+              title: t("lint.addCrossRefs", { page: item.page }),
+              description: item.detail,
+              affectedPages: [item.page],
+              options: [
+                { label: t("lint.openEdit"), action: `open:${item.page}` },
+                { label: t("lint.skip"), action: "Skip" },
+              ],
+            })
           }
-          // Remove from store
           useLintStore.getState().removeItem(item.id)
           break
         }
 
         case "broken-link": {
-          // Option: remove the broken link from the page, or send to Review for manual fix
           const pagePath = `${pp}/wiki/${item.page}`
-          useReviewStore.getState().addItem({
-            type: "confirm",
-            title: t("lint.fixBrokenLink", { page: item.page }),
-            description: item.detail,
-            affectedPages: [item.page],
-            options: [
-              { label: t("lint.openEdit"), action: `open:${item.page}` },
-              { label: t("lint.deletePage"), action: `delete:${pagePath}` },
-              { label: t("lint.skip"), action: "Skip" },
-            ],
-          })
+          if (item.brokenTarget && item.suggestedTarget) {
+            const content = await readFile(pagePath)
+            await writeFile(pagePath, rewriteWikilinkTarget(content, item.brokenTarget, item.suggestedTarget))
+          } else if (item.brokenTarget) {
+            const content = await readFile(pagePath)
+            const stub = await ensureBrokenLinkStub(pp, item.brokenTarget)
+            await writeFile(pagePath, rewriteWikilinkTarget(content, item.brokenTarget, stub.relativePath))
+          } else {
+            useReviewStore.getState().addItem({
+              type: "confirm",
+              title: t("lint.fixBrokenLink", { page: item.page }),
+              description: item.detail,
+              affectedPages: [item.page],
+              options: [
+                { label: t("lint.openEdit"), action: `open:${item.page}` },
+                { label: t("lint.deletePage"), action: `delete:${pagePath}` },
+                { label: t("lint.skip"), action: "Skip" },
+              ],
+            })
+          }
           useLintStore.getState().removeItem(item.id)
           break
         }
 
         case "no-outlinks": {
-          // Send to Review — user should add links manually
-          useReviewStore.getState().addItem({
-            type: "suggestion",
-            title: t("lint.addCrossRefs", { page: item.page }),
-            description: t("lint.addCrossRefsDescription"),
-            affectedPages: [item.page],
-            options: [
-              { label: t("lint.openEdit"), action: `open:${item.page}` },
-              { label: t("lint.skip"), action: "Skip" },
-            ],
-          })
+          if (item.suggestedTarget) {
+            const pagePath = `${pp}/wiki/${item.page}`
+            const content = await readFile(pagePath)
+            await writeFile(pagePath, appendWikilink(content, item.suggestedTarget))
+          } else {
+            useReviewStore.getState().addItem({
+              type: "suggestion",
+              title: t("lint.addCrossRefs", { page: item.page }),
+              description: t("lint.addCrossRefsDescription"),
+              affectedPages: [item.page],
+              options: [
+                { label: t("lint.openEdit"), action: `open:${item.page}` },
+                { label: t("lint.skip"), action: "Skip" },
+              ],
+            })
+          }
           useLintStore.getState().removeItem(item.id)
           break
         }
@@ -196,6 +217,7 @@ export function LintView() {
       bumpDataVersion()
     } catch (err) {
       console.error("Fix failed:", err)
+      setFixError(err instanceof Error ? err.message : String(err))
     } finally {
       setFixingId(null)
     }
@@ -267,6 +289,11 @@ export function LintView() {
       </div>
 
       <div className="flex-1 overflow-y-auto">
+        {fixError && (
+          <div className="mx-3 mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {t("lint.fixFailed", { error: fixError })}
+          </div>
+        )}
         {!showResults ? (
           <div className="flex flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
             <CheckCircle2 className="h-8 w-8 text-muted-foreground/30" />
@@ -374,6 +401,21 @@ function LintCard({
       </div>
 
       <p className="mb-2 text-xs text-muted-foreground">{item.detail}</p>
+
+      {(item.suggestedTarget || item.suggestedSource) && (
+        <div className="mb-2 rounded-md border border-emerald-500/20 bg-emerald-500/5 px-2 py-1.5 text-xs text-emerald-700 dark:text-emerald-300">
+          <div className="flex items-start gap-1.5">
+            <Link className="mt-0.5 h-3 w-3 shrink-0" />
+            <div className="min-w-0">
+              <div className="font-medium">
+                {item.suggestedSource
+                  ? t("lint.suggestedSource", { page: item.suggestedSource })
+                  : t("lint.suggestedTarget", { page: item.suggestedTarget })}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {item.affectedPages && item.affectedPages.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-1">

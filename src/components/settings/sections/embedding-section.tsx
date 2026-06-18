@@ -24,6 +24,7 @@ type ReindexState =
   | { kind: "idle" }
   | { kind: "running"; done: number; total: number }
   | { kind: "done"; count: number }
+  | { kind: "error"; message: string }
 
 type TestState =
   | { kind: "idle" }
@@ -46,6 +47,18 @@ const RESERVED_HEADER_NAMES = new Set([
   "x-goog-api-key",
 ])
 const HTTP_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
+const EMBEDDING_MODEL_SUGGESTIONS = [
+  "text-embedding-3-small",
+  "text-embedding-3-large",
+  "gemini-embedding-001",
+  "gemini-embedding-2",
+  "text-embedding-004",
+  "doubao-embedding-vision",
+  "doubao-embedding-text-240715",
+  "text-embedding-qwen3-embedding-0.6b",
+  "nomic-embed-text",
+  "mxbai-embed-large",
+]
 
 function headersToText(headers: Record<string, string>): string {
   return Object.entries(headers)
@@ -103,11 +116,22 @@ export function EmbeddingSection({ draft, setDraft }: Props) {
   const handleReindex = useCallback(async () => {
     if (!project) return
     setReindex({ kind: "running", done: 0, total: 0 })
-    const count = await embedAllPages(project.path, embeddingConfig, (done, total) => {
-      setReindex({ kind: "running", done, total })
-    })
-    setReindex({ kind: "done", count })
-    await refreshStats()
+    try {
+      const count = await embedAllPages(
+        project.path,
+        embeddingConfig,
+        (done, total) => {
+          setReindex({ kind: "running", done, total })
+        },
+        { clearExisting: true },
+      )
+      setReindex({ kind: "done", count })
+      await refreshStats()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      setReindex({ kind: "error", message })
+      await refreshStats()
+    }
   }, [project, embeddingConfig, refreshStats])
 
   const handleDropLegacy = useCallback(async () => {
@@ -205,8 +229,17 @@ export function EmbeddingSection({ draft, setDraft }: Props) {
             <Input
               value={draft.embeddingModel}
               onChange={(e) => setDraft("embeddingModel", e.target.value)}
+              list="embedding-model-suggestions"
               placeholder="e.g. text-embedding-qwen3-embedding-0.6b or gemini-embedding-001"
             />
+            <datalist id="embedding-model-suggestions">
+              {EMBEDDING_MODEL_SUGGESTIONS.map((model) => (
+                <option key={model} value={model} />
+              ))}
+            </datalist>
+            <p className="text-xs text-muted-foreground">
+              {t("settings.sections.embedding.modelHint")}
+            </p>
           </div>
 
           <div className="space-y-2">
@@ -384,6 +417,12 @@ export function EmbeddingSection({ draft, setDraft }: Props) {
             {reindex.kind === "done" && (
               <p className="text-xs text-muted-foreground">
                 {t("settings.sections.embedding.reindexDone", { count: reindex.count })}
+              </p>
+            )}
+
+            {reindex.kind === "error" && (
+              <p className="text-xs text-destructive">
+                {t("settings.sections.embedding.reindexError", { message: reindex.message })}
               </p>
             )}
 

@@ -38,6 +38,7 @@ vi.mock("@/lib/project-store", () => ({
 }))
 
 import {
+  isProjectManagedScheduledImportPath,
   resolveImportPath,
   scheduledImportDestinationForFile,
   scanAndImport,
@@ -90,6 +91,28 @@ describe("scheduled import path handling", () => {
     )
 
     expect(dest).toBe(`${projectPath}/raw/sources/source.md`)
+  })
+
+  it("detects scheduled import paths managed by the project itself", () => {
+    expect(isProjectManagedScheduledImportPath(projectPath, projectPath)).toBe(true)
+    expect(
+      isProjectManagedScheduledImportPath(projectPath, `${projectPath}/raw/sources`),
+    ).toBe(true)
+    expect(
+      isProjectManagedScheduledImportPath(projectPath, `${projectPath}/raw`),
+    ).toBe(true)
+    expect(
+      isProjectManagedScheduledImportPath(projectPath, `${projectPath}/wiki`),
+    ).toBe(true)
+    expect(
+      isProjectManagedScheduledImportPath(projectPath, `${projectPath}/.llm-wiki`),
+    ).toBe(true)
+    expect(
+      isProjectManagedScheduledImportPath(projectPath, "/Users/me"),
+    ).toBe(true)
+    expect(
+      isProjectManagedScheduledImportPath(projectPath, "/Users/me/inbox"),
+    ).toBe(false)
   })
 
   it("sanitizes Windows-unsafe destination path segments with a stable suffix", () => {
@@ -180,6 +203,13 @@ describe("scanAndImport failure handling", () => {
     expect(mocks.copyFile).toHaveBeenCalled()
     expect(mocks.enqueueSourceIngest).toHaveBeenCalled()
     expect(mocks.writeFileAtomic).not.toHaveBeenCalled()
+  })
+
+  it("does not leave the scanner locked after a managed project path is skipped", async () => {
+    await scanAndImport(project, `${project.path}/raw/sources`)
+    await scanAndImport(project, "/Users/me/inbox")
+
+    expect(mocks.listDirectory).toHaveBeenCalledWith("/Users/me/inbox")
   })
 
   it("continues scanning when one file is locked or unreadable", async () => {

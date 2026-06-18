@@ -323,21 +323,31 @@ export const LLM_PRESETS: LlmPreset[] = [
     baseUrl: "https://open.bigmodel.cn/api/paas/v4",
     defaultModel: "glm-4.6",
     apiMode: "chat_completions",
-    // Current-gen Zhipu BigModel lineup. glm-5 / glm-5.1 are routed
-    // through the Z.AI international endpoint (api.z.ai) so they're
-    // not on this preset's suggestion list — users targeting those
-    // should type the id or point the base URL at api.z.ai.
+    // Current Zhipu BigModel lineup on /api/paas/v4/chat/completions.
+    // Vision-capable models use the same OpenAI-compatible image_url
+    // content blocks as our generic chat-completions wire.
     suggestedModels: [
+      "glm-5.1",
+      "glm-5-turbo",
+      "glm-5",
+      "glm-5v-turbo",
+      "glm-4.7",
+      "glm-4.7-flash",
+      "glm-4.7-flashx",
       "glm-4.6",
+      "glm-4.6v",
       "glm-4.5",
+      "glm-4.5v",
       "glm-4.5-air",
       "glm-4.5-airx",
       "glm-4.5-flash",
+      "glm-4-flash-250414",
+      "glm-4-flashx-250414",
       "glm-4-plus",
       "glm-4-air",
       "glm-4-flash",
-      "glm-zero-preview",
       "glm-4v-plus",
+      "glm-zero-preview",
     ],
     suggestedContextSize: 128000,
   },

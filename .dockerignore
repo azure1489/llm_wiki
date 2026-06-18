@@ -1,0 +1,8 @@
+# 构建上下文裁剪：这些目录会在容器内重新生成，避免传入宿主/macOS 产物
+node_modules
+mcp-server/node_modules
+src-tauri/target
+dist
+.git
+**/*.log
+.DS_Store

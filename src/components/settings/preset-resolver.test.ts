@@ -102,4 +102,64 @@ describe("resolveConfig", () => {
     expect(resolved.azureApiVersion).toBe("2025-01-01-preview")
     expect(resolved.azureModelFamily).toBe("gpt5")
   })
+
+  it("carries local CLI isolation for Claude Code and Codex CLI presets", () => {
+    const preset: LlmPreset = {
+      id: "codex-cli",
+      label: "Codex CLI",
+      provider: "codex-cli",
+      defaultModel: "gpt-5",
+    }
+
+    const resolved = resolveConfig(
+      preset,
+      { localCliIsolation: true },
+      fallbackConfig(),
+    )
+
+    expect(resolved.localCliIsolation).toBe(true)
+  })
+
+  it("carries Codex CLI timeout only for the Codex CLI preset", () => {
+    const codexPreset: LlmPreset = {
+      id: "codex-cli",
+      label: "Codex CLI",
+      provider: "codex-cli",
+      defaultModel: "gpt-5",
+    }
+    const claudePreset: LlmPreset = {
+      id: "claude-code-cli",
+      label: "Claude Code CLI",
+      provider: "claude-code",
+      defaultModel: "sonnet",
+    }
+
+    expect(resolveConfig(
+      codexPreset,
+      { codexCliTimeoutMinutes: 9999 },
+      fallbackConfig(),
+    ).codexCliTimeoutMinutes).toBe(240)
+    expect(resolveConfig(
+      claudePreset,
+      { codexCliTimeoutMinutes: 45 },
+      fallbackConfig(),
+    ).codexCliTimeoutMinutes).toBeUndefined()
+  })
+
+  it("does not apply local CLI isolation to hosted providers", () => {
+    const preset: LlmPreset = {
+      id: "openai",
+      label: "OpenAI",
+      provider: "openai",
+      defaultModel: "gpt-5",
+    }
+
+    const resolved = resolveConfig(
+      preset,
+      { localCliIsolation: true },
+      fallbackConfig({ localCliIsolation: true }),
+    )
+
+    expect(resolved.localCliIsolation).toBe(false)
+  })
 })

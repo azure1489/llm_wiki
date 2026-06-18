@@ -1,5 +1,16 @@
-import { describe, it, expect } from "vitest"
-import { isFetchNetworkError } from "./llm-client"
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
+
+// Stub getHttpFetch so streamChat hits our in-test responder; keep the
+// rest of tauri-fetch (notably isFetchNetworkError) real so the existing
+// cross-webview tests below still exercise the genuine classifier.
+const mockHttpFetch = vi.fn<(url: string, opts?: RequestInit) => Promise<Response>>()
+vi.mock("./tauri-fetch", async () => {
+  const actual = await vi.importActual<typeof import("./tauri-fetch")>("./tauri-fetch")
+  return { ...actual, getHttpFetch: () => Promise.resolve(mockHttpFetch) }
+})
+
+import { isFetchNetworkError, streamChat } from "./llm-client"
+import type { LlmConfig } from "@/stores/wiki-store"
 
 /**
  * Guards for cross-webview error detection. Tauri renders the frontend
@@ -48,5 +59,155 @@ describe("isFetchNetworkError — cross-webview fetch failures", () => {
     expect(isFetchNetworkError(null)).toBe(false)
     expect(isFetchNetworkError(undefined)).toBe(false)
     expect(isFetchNetworkError({ message: "Load failed" })).toBe(false)
+  })
+})
+
+/**
+ * The streaming-path abort handling. When the 30-min backstop fires
+ * mid-stream the Tauri HTTP plugin tears the body stream down with a
+ * BARE STRING "Request cancelled" (controller.error(string)), not an
+ * Error. The old guard only matched `err instanceof Error`, so that
+ * string fell through to the generic branch and surfaced verbatim —
+ * exactly the cryptic "request cancelled" the dedup scan showed. These
+ * pin down that the string is now recognized as an abort and mapped to
+ * the actionable timeout message (or a silent cancel when no backstop).
+ */
+const cfg: LlmConfig = {
+  provider: "ollama",
+  apiKey: "",
+  model: "qwen3:8b",
+  ollamaUrl: "http://localhost:11434",
+  customEndpoint: "",
+  apiMode: "chat_completions",
+  maxContextSize: 8192,
+}
+
+/** A Response whose reader.read() stays pending until we reject it,
+ *  letting the test interleave the 30-min backstop before the abort.
+ *  `readCalled` resolves once streamChat reaches read(), so the test
+ *  can await it instead of guessing how many microtasks to flush. */
+function pendingStreamResponse(): {
+  response: Response
+  getReject: () => (e: unknown) => void
+  readCalled: Promise<void>
+} {
+  let reject!: (e: unknown) => void
+  let signalReadCalled!: () => void
+  const readCalled = new Promise<void>((res) => { signalReadCalled = res })
+  const reader = {
+    read: () =>
+      new Promise<never>((_resolve, rej) => {
+        reject = rej
+        signalReadCalled()
+      }),
+    releaseLock: () => {},
+    cancel: () => {},
+  }
+  const response = {
+    ok: true,
+    body: { getReader: () => reader },
+  } as unknown as Response
+  return { response, getReject: () => reject, readCalled }
+}
+
+describe("streamChat — mid-stream abort mapping", () => {
+  beforeEach(() => {
+    mockHttpFetch.mockReset()
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("maps the plugin's bare-string abort to the timeout message when the 30-min backstop fired", async () => {
+    const { response, getReject, readCalled } = pendingStreamResponse()
+    mockHttpFetch.mockResolvedValue(response)
+
+    const onError = vi.fn()
+    const onDone = vi.fn()
+    const promise = streamChat(
+      cfg,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone, onError },
+      undefined,
+      {},
+    )
+
+    // Wait until streamChat is parked in read(), then fire the long-horizon
+    // backstop and let the plugin error the stream with its bare string.
+    await readCalled
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000)
+    getReject()("Request cancelled")
+    await promise
+
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0][0].message).toMatch(/timed out after 30 min/)
+    expect(onDone).not.toHaveBeenCalled()
+  })
+
+  it("treats a bare-string abort as a silent cancel when the backstop did NOT fire", async () => {
+    const { response, getReject, readCalled } = pendingStreamResponse()
+    mockHttpFetch.mockResolvedValue(response)
+
+    const onError = vi.fn()
+    const onDone = vi.fn()
+    const promise = streamChat(
+      cfg,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone, onError },
+      undefined,
+      {},
+    )
+
+    await readCalled
+    getReject()("Request cancelled")
+    await promise
+
+    expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("recognises lowercase and single-l cancelled spellings as silent cancels", async () => {
+    for (const message of ["request cancelled", "Request canceled"]) {
+      const { response, getReject, readCalled } = pendingStreamResponse()
+      mockHttpFetch.mockResolvedValueOnce(response)
+
+      const onError = vi.fn()
+      const onDone = vi.fn()
+      const promise = streamChat(
+        cfg,
+        [{ role: "user", content: "hi" }],
+        { onToken: vi.fn(), onDone, onError },
+        undefined,
+        {},
+      )
+
+      await readCalled
+      getReject()(message)
+      await promise
+
+      expect(onDone).toHaveBeenCalledTimes(1)
+      expect(onError).not.toHaveBeenCalled()
+    }
+  })
+
+  it("treats pre-fetch bare-string cancel spellings as silent cancels", async () => {
+    for (const message of ["request cancelled", "Request canceled"]) {
+      mockHttpFetch.mockReset()
+      mockHttpFetch.mockRejectedValueOnce(message)
+
+      const onError = vi.fn()
+      const onDone = vi.fn()
+      await streamChat(
+        cfg,
+        [{ role: "user", content: "hi" }],
+        { onToken: vi.fn(), onDone, onError },
+        undefined,
+        {},
+      )
+
+      expect(onDone).toHaveBeenCalledTimes(1)
+      expect(onError).not.toHaveBeenCalled()
+    }
   })
 })

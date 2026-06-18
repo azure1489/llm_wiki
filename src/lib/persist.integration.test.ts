@@ -219,6 +219,29 @@ describe("chat persistence — round-trip (new format)", () => {
     expect(loaded.messages).toHaveLength(2)
   })
 
+  it("does not persist base64 chat images into conversation JSON", async () => {
+    const convs = [makeConv("c1", "Vision")]
+    const msg: DisplayMessage = {
+      ...makeMsg("m1", "c1", "what is this?"),
+      images: [{ mediaType: "image/png", dataBase64: "A".repeat(1024) }],
+    }
+
+    await saveChatHistory(tmp.path, convs, [msg])
+    expect(msg.images).toHaveLength(1)
+    expect(msg.images?.[0].dataBase64).toBe("A".repeat(1024))
+
+    const raw = await readFileRaw(`${tmp.path}/.llm-wiki/chats/c1.json`)
+    expect(raw).not.toContain("dataBase64")
+    expect(raw).not.toContain("image/png")
+
+    const loaded = await loadChatHistory(tmp.path)
+    expect(loaded.messages[0]).toMatchObject({
+      id: "m1",
+      content: "what is this?",
+    })
+    expect(loaded.messages[0].images).toBeUndefined()
+  })
+
   it("caps each conversation's persisted messages at 100 (oldest dropped)", async () => {
     const convs = [makeConv("c1")]
     const msgs = Array.from({ length: 150 }, (_, i) =>

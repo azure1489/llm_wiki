@@ -46,6 +46,12 @@ interface PersistedChatData {
   messages: DisplayMessage[]
 }
 
+function stripPersistedMessageImages(msg: DisplayMessage): DisplayMessage {
+  if (!msg.images || msg.images.length === 0) return msg
+  const { images: _images, ...rest } = msg
+  return rest
+}
+
 export async function saveChatHistory(
   projectPath: string,
   conversations: Conversation[],
@@ -64,7 +70,10 @@ export async function saveChatHistory(
   const byConversation = new Map<string, DisplayMessage[]>()
   for (const msg of messages) {
     const list = byConversation.get(msg.conversationId) ?? []
-    list.push(msg)
+    // Images can be multi-megabyte base64 payloads. Keep them in memory for the
+    // current chat turn, but don't persist them into chat JSON where they would
+    // quickly bloat auto-save files and project backups.
+    list.push(stripPersistedMessageImages(msg))
     byConversation.set(msg.conversationId, list)
   }
 

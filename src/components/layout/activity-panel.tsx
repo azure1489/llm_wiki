@@ -430,7 +430,7 @@ function FileSyncRow({ task, onRetry, onIgnore }: { task: FileChangeTask; onRetr
 }
 
 function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => void }) {
-  const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
+  const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
   const project = useWikiStore((s) => s.project)
 
   function handleFileClick(filePath: string) {
@@ -439,7 +439,7 @@ function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => 
     const fullPath = isAbsolutePath(filePath)
       ? normalizePath(filePath)
       : `${pp}/${filePath}`
-    setSelectedFile(fullPath)
+    openPathInPreview(fullPath)
   }
 
   return (

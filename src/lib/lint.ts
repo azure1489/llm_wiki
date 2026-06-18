@@ -12,7 +12,18 @@ export interface LintResult {
   page: string
   detail: string
   affectedPages?: string[]
+  brokenTarget?: string
+  suggestedTarget?: string
+  suggestedSource?: string
 }
+
+const BROKEN_LINK_SUGGESTION_MIN_SCORE = 0.74
+const RELATED_PAGE_SUGGESTION_MIN_SCORE = 0.08
+const SAME_FOLDER_SCORE_BONUS = 0.08
+const SINGLE_CJK_TOKEN_WEIGHT = 0.35
+const SUGGESTION_TOKEN_WINDOW = 4000
+const SAME_BASENAME_SCORE = 0.96
+const CONTAINS_TARGET_SCORE = 0.82
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -41,6 +52,76 @@ function extractWikilinks(content: string): string[] {
 function relativeToSlug(relativePath: string): string {
   // relativePath relative to wiki/ dir, e.g. "entities/foo-bar" or "queries/my-page-2024-01-01"
   return relativePath.replace(/\.md$/, "")
+}
+
+function normalizeLinkTarget(target: string): string {
+  return normalizePath(target)
+    .replace(/^wiki\//i, "")
+    .replace(/\.md$/i, "")
+    .trim()
+    .toLowerCase()
+}
+
+function extractTitle(content: string, fallbackPath: string): string {
+  const frontmatter = content.match(/^---\s*\n([\s\S]*?)\n---/)
+  if (frontmatter) {
+    const title = frontmatter[1].match(/^title:\s*["']?(.+?)["']?\s*$/m)
+    if (title?.[1]?.trim()) return title[1].trim()
+  }
+  const heading = content.match(/^#\s+(.+)$/m)
+  if (heading?.[1]?.trim()) return heading[1].trim()
+  return getFileName(fallbackPath)
+    .replace(/\.md$/i, "")
+    .replace(/[-_]+/g, " ")
+}
+
+function tokenizeForSuggestion(text: string): Set<string> {
+  const tokens = new Set<string>()
+  const normalized = text.normalize("NFKC").toLowerCase()
+  for (const match of normalized.matchAll(/[\p{L}\p{N}]+/gu)) {
+    const token = match[0]
+    if (token.length >= 2) tokens.add(token)
+    if (/[\u3400-\u9fff]/u.test(token)) {
+      for (const char of Array.from(token)) tokens.add(char)
+    }
+  }
+  return tokens
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0
+  if (!a) return b.length
+  if (!b) return a.length
+  const previous = Array.from({ length: b.length + 1 }, (_, i) => i)
+  const current = new Array<number>(b.length + 1)
+  for (let i = 1; i <= a.length; i++) {
+    current[0] = i
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1
+      current[j] = Math.min(
+        current[j - 1] + 1,
+        previous[j] + 1,
+        previous[j - 1] + cost,
+      )
+    }
+    for (let j = 0; j <= b.length; j++) previous[j] = current[j]
+  }
+  return previous[b.length]
+}
+
+function stringSimilarity(a: string, b: string): number {
+  const left = normalizeLinkTarget(a)
+  const right = normalizeLinkTarget(b)
+  if (!left || !right) return 0
+  if (left === right) return 1
+  const leftBase = getFileName(left)
+  const rightBase = getFileName(right)
+  if (leftBase === rightBase) return SAME_BASENAME_SCORE
+  if (right.includes(left) || left.includes(right)) return CONTAINS_TARGET_SCORE
+  if (leftBase.length < 5 || rightBase.length < 5) return 0
+  const maxLen = Math.max(leftBase.length, rightBase.length)
+  if (maxLen === 0) return 0
+  return 1 - levenshtein(leftBase, rightBase) / maxLen
 }
 
 /**
@@ -84,18 +165,71 @@ export async function runStructuralLint(projectPath: string): Promise<LintResult
   const slugMap = buildSlugMap(contentFiles, wikiRoot)
 
   // Read all content files
-  type PageData = { path: string; slug: string; content: string; outlinks: string[] }
+  type PageData = {
+    path: string
+    shortName: string
+    slug: string
+    title: string
+    content: string
+    outlinks: string[]
+    tokens: Set<string>
+  }
   const pages: PageData[] = []
 
   for (const f of contentFiles) {
     try {
       const content = await readFile(f.path)
-      const slug = relativeToSlug(getRelativePath(f.path, wikiRoot))
+      const shortName = getRelativePath(f.path, wikiRoot)
+      const slug = relativeToSlug(shortName)
+      const title = extractTitle(content, shortName)
       const outlinks = extractWikilinks(content)
-      pages.push({ path: f.path, slug, content, outlinks })
+      const slugName = getFileName(slug)
+      const tokens = tokenizeForSuggestion(`${title}\n${slugName}\n${content.slice(0, SUGGESTION_TOKEN_WINDOW)}`)
+      pages.push({ path: f.path, shortName, slug, title, content, outlinks, tokens })
     } catch {
       // skip unreadable files
     }
+  }
+
+  function suggestBrokenTarget(target: string): PageData | undefined {
+    let best: { page: PageData; score: number } | undefined
+    for (const candidate of pages) {
+      const score = Math.max(
+        stringSimilarity(target, candidate.slug),
+        stringSimilarity(target, candidate.shortName),
+        stringSimilarity(target, candidate.title),
+      )
+      if (score > (best?.score ?? 0)) best = { page: candidate, score }
+    }
+    return best && best.score >= BROKEN_LINK_SUGGESTION_MIN_SCORE ? best.page : undefined
+  }
+
+  function suggestRelatedPage(page: PageData, direction: "source" | "target"): PageData | undefined {
+    const existingOutlinks = new Set(page.outlinks.map(normalizeLinkTarget))
+    let best: { page: PageData; score: number } | undefined
+    for (const candidate of pages) {
+      if (candidate.shortName === page.shortName) continue
+      if (direction === "target") {
+        const candidateKeys = [
+          normalizeLinkTarget(candidate.slug),
+          normalizeLinkTarget(candidate.shortName),
+          normalizeLinkTarget(getFileName(candidate.shortName).replace(/\.md$/i, "")),
+        ]
+        if (candidateKeys.some((key) => existingOutlinks.has(key))) continue
+      }
+      let overlap = 0
+      for (const token of page.tokens) {
+        if (candidate.tokens.has(token)) overlap += token.length > 1 ? 1 : SINGLE_CJK_TOKEN_WEIGHT
+      }
+      if (overlap === 0) continue
+      const folderBonus =
+        page.shortName.split("/")[0] === candidate.shortName.split("/")[0] ? SAME_FOLDER_SCORE_BONUS : 0
+      const score =
+        overlap / Math.sqrt(Math.max(1, page.tokens.size) * Math.max(1, candidate.tokens.size)) +
+        folderBonus
+      if (score > (best?.score ?? 0)) best = { page: candidate, score }
+    }
+    return best && best.score >= RELATED_PAGE_SUGGESTION_MIN_SCORE ? best.page : undefined
   }
 
   // Build inbound link count. Lookups are case-insensitive — [[Transformer]]
@@ -114,26 +248,30 @@ export async function runStructuralLint(projectPath: string): Promise<LintResult
   const results: LintResult[] = []
 
   for (const p of pages) {
-    const shortName = getRelativePath(p.path, wikiRoot)
+    const shortName = p.shortName
 
     // Orphan: no inbound links (lowercased slug for case-insensitive match)
     const inbound = inboundCounts.get(p.slug.toLowerCase()) ?? 0
     if (inbound === 0) {
+      const suggestedSource = suggestRelatedPage(p, "source")
       results.push({
         type: "orphan",
         severity: "info",
         page: shortName,
         detail: "No other pages link to this page.",
+        suggestedSource: suggestedSource?.shortName,
       })
     }
 
     // No outbound links
     if (p.outlinks.length === 0) {
+      const suggestedTarget = suggestRelatedPage(p, "target")
       results.push({
         type: "no-outlinks",
         severity: "info",
         page: shortName,
         detail: "This page has no [[wikilink]] references to other pages.",
+        suggestedTarget: suggestedTarget?.shortName,
       })
     }
 
@@ -143,11 +281,14 @@ export async function runStructuralLint(projectPath: string): Promise<LintResult
       const basename = getFileName(link).replace(/\.md$/, "").toLowerCase()
       const exists = slugMap.has(lookup) || slugMap.has(basename)
       if (!exists) {
+        const suggestedTarget = suggestBrokenTarget(link)
         results.push({
           type: "broken-link",
           severity: "warning",
           page: shortName,
           detail: `Broken link: [[${link}]] — target page not found.`,
+          brokenTarget: link,
+          suggestedTarget: suggestedTarget?.shortName,
         })
       }
     }

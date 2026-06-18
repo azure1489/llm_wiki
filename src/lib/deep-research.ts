@@ -1,12 +1,13 @@
 import { anyTxtSearchSmart, hasConfiguredAnyTxt } from "./anytxt-search"
 import { hasConfiguredSearchProvider, resolveSearchConfig, webSearch } from "./web-search"
 import { streamChat } from "./llm-client"
-import { autoIngest } from "./ingest"
+import { autoIngest, currentWikiDate } from "./ingest"
 import { writeFile, readFile, listDirectory } from "@/commands/fs"
 import { useWikiStore, type LlmConfig, type SearchApiConfig } from "@/stores/wiki-store"
 import { useResearchStore } from "@/stores/research-store"
 import { normalizePath } from "@/lib/path-utils"
 import { buildLanguageDirective } from "@/lib/output-language"
+import { makeQueryFileName } from "@/lib/wiki-filename"
 
 const MAX_RESEARCH_SOURCES = 20
 
@@ -22,6 +23,36 @@ interface CollectResearchSourceOptions {
 interface ResearchSourceCollection {
   results: import("./web-search").WebSearchResult[]
   errors: string[]
+}
+
+export function noResearchSourcesTaskPatch(sourceErrors: string[]): {
+  status: "done" | "error"
+  synthesis: string
+  error: string | null
+} {
+  // If every selected source produced zero usable results and at least
+  // one source failed, surface the failure state explicitly. Otherwise
+  // the UI shows "completed" for a task that could not actually search.
+  if (sourceErrors.length > 0) {
+    return {
+      status: "error",
+      synthesis: "",
+      error: sourceErrors.join("\n"),
+    }
+  }
+  return {
+    status: "done",
+    synthesis: "No research sources found.",
+    error: null,
+  }
+}
+
+export function makeDeepResearchFileName(topic: string, now: Date = new Date()): {
+  fileName: string
+  date: string
+} {
+  const { fileName } = makeQueryFileName(`research-${topic}`, now)
+  return { fileName, date: currentWikiDate(now) }
 }
 
 /**
@@ -114,6 +145,21 @@ function hasAnyTxtSource(searchConfig: SearchApiConfig): boolean {
   return sourceMode === "anytxt" || sourceMode === "both"
 }
 
+function isActiveProjectPath(projectPath: string): boolean {
+  const activePath = useWikiStore.getState().project?.path
+  return Boolean(activePath && normalizePath(activePath) === normalizePath(projectPath))
+}
+
+function updateTaskIfActive(
+  projectPath: string,
+  taskId: string,
+  patch: Parameters<ReturnType<typeof useResearchStore.getState>["updateTask"]>[1],
+): boolean {
+  if (!isActiveProjectPath(projectPath)) return false
+  useResearchStore.getState().updateTask(taskId, patch)
+  return true
+}
+
 /**
  * Process queued tasks up to maxConcurrent limit.
  */
@@ -141,12 +187,12 @@ async function executeResearch(
   searchConfig: SearchApiConfig,
 ) {
   const pp = normalizePath(projectPath)
-  const store = useResearchStore.getState()
 
   try {
+    if (!isActiveProjectPath(pp)) return
     // Step 1: gather research sources — use multiple queries if available,
     // merge Web Search and local AnyTXT results, then deduplicate.
-    store.updateTask(taskId, { status: "searching" })
+    if (!updateTaskIfActive(pp, taskId, { status: "searching" })) return
 
     const task = useResearchStore.getState().tasks.find((t) => t.id === taskId)
     const queries = task?.searchQueries && task.searchQueries.length > 0
@@ -159,21 +205,19 @@ async function executeResearch(
       { webSearch, anyTxtSearch: anyTxtSearchSmart },
       { llmConfig },
     )
+    if (!isActiveProjectPath(pp)) return
 
     const webResults = allResults
-    store.updateTask(taskId, { webResults })
+    if (!updateTaskIfActive(pp, taskId, { webResults })) return
 
     if (webResults.length === 0) {
-      store.updateTask(taskId, {
-        status: "done",
-        synthesis: sourceErrors.length > 0 ? sourceErrors.join("\n") : "No research sources found.",
-      })
-      onTaskFinished(pp, llmConfig, searchConfig)
+      if (!updateTaskIfActive(pp, taskId, noResearchSourcesTaskPatch(sourceErrors))) return
+      if (isActiveProjectPath(pp)) onTaskFinished(pp, llmConfig, searchConfig)
       return
     }
 
     // Step 2: LLM synthesis
-    store.updateTask(taskId, { status: "synthesizing" })
+    if (!updateTaskIfActive(pp, taskId, { status: "synthesizing" })) return
 
     const searchContext = webResults
       .map((r, i) => `[${i + 1}] **${r.title}** (${r.source})\n${r.snippet}`)
@@ -218,12 +262,14 @@ async function executeResearch(
       ],
       {
         onToken: (token) => {
+          if (!isActiveProjectPath(pp)) return
           accumulated += token
           // Update synthesis progressively so UI shows real-time text
           useResearchStore.getState().updateTask(taskId, { synthesis: accumulated })
         },
         onDone: () => {},
         onError: (err) => {
+          if (!isActiveProjectPath(pp)) return
           useResearchStore.getState().updateTask(taskId, {
             status: "error",
             error: err.message,
@@ -234,16 +280,15 @@ async function executeResearch(
 
     // Check if errored during streaming
     if (useResearchStore.getState().tasks.find((t) => t.id === taskId)?.status === "error") {
-      onTaskFinished(pp, llmConfig, searchConfig)
+      if (isActiveProjectPath(pp)) onTaskFinished(pp, llmConfig, searchConfig)
       return
     }
+    if (!isActiveProjectPath(pp)) return
 
     // Step 3: Save to wiki
-    store.updateTask(taskId, { status: "saving", synthesis: accumulated })
+    if (!updateTaskIfActive(pp, taskId, { status: "saving", synthesis: accumulated })) return
 
-    const date = new Date().toISOString().slice(0, 10)
-    const slug = topic.toLowerCase().replace(/[^a-z0-9\s-]/g, "").trim().replace(/\s+/g, "-").slice(0, 50)
-    const fileName = `research-${slug}-${date}.md`
+    const { fileName, date } = makeDeepResearchFileName(topic)
     const filePath = `${pp}/wiki/queries/${fileName}`
 
     const references = webResults
@@ -278,33 +323,37 @@ async function executeResearch(
     await writeFile(filePath, pageContent)
     const savedPath = `wiki/queries/${fileName}`
 
-    useResearchStore.getState().updateTask(taskId, {
+    if (!updateTaskIfActive(pp, taskId, {
       status: "done",
       savedPath,
-    })
+    })) return
 
     // Refresh tree
     try {
       const tree = await listDirectory(pp)
-      useWikiStore.getState().setFileTree(tree)
-      useWikiStore.getState().bumpDataVersion()
+      if (isActiveProjectPath(pp)) {
+        useWikiStore.getState().setFileTree(tree)
+        useWikiStore.getState().bumpDataVersion()
+      }
     } catch {
       // ignore
     }
 
     // Auto-ingest the research result to generate entities, concepts, cross-references
-    autoIngest(pp, `${pp}/${savedPath}`, llmConfig).catch((err) => {
-      console.error("Failed to auto-ingest research result:", err)
-    })
+    if (isActiveProjectPath(pp)) {
+      autoIngest(pp, `${pp}/${savedPath}`, llmConfig).catch((err) => {
+        console.error("Failed to auto-ingest research result:", err)
+      })
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    useResearchStore.getState().updateTask(taskId, {
+    updateTaskIfActive(pp, taskId, {
       status: "error",
       error: message,
     })
   }
 
-  onTaskFinished(pp, llmConfig, searchConfig)
+  if (isActiveProjectPath(pp)) onTaskFinished(pp, llmConfig, searchConfig)
 }
 
 function onTaskFinished(

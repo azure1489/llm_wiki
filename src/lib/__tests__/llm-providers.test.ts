@@ -497,7 +497,7 @@ describe("Origin header — local LLM CORS workaround", () => {
     expect(cfg.headers["Origin"]).toBe("http://localhost")
   })
 
-  it("custom OpenAI-compat endpoint gets the same Origin override (LM Studio / llama.cpp / vLLM)", () => {
+  it("local custom OpenAI-compat endpoint gets the Origin override (LM Studio / llama.cpp / vLLM)", () => {
     // For these servers Origin is ignored entirely — but we send
     // the value anyway so behavior is uniform across local-LLM
     // providers and the rare hardened deployment that does check
@@ -512,6 +512,19 @@ describe("Origin header — local LLM CORS workaround", () => {
       apiMode: "chat_completions",
     } as RealLlmConfig)
     expect(cfg.headers["Origin"]).toBe("http://localhost")
+  })
+
+  it("public custom OpenAI-compat endpoint does not get the local Origin override", () => {
+    const cfg = getProviderConfig({
+      provider: "custom",
+      apiKey: "key",
+      model: "qwen3",
+      ollamaUrl: "",
+      customEndpoint: "https://gateway.example.com/v1",
+      maxContextSize: 8192,
+      apiMode: "chat_completions",
+    } as RealLlmConfig)
+    expect(cfg.headers["Origin"]).toBeUndefined()
   })
 
   it("commercial provider (OpenAI) does NOT get an explicit Origin override", () => {

@@ -7,8 +7,9 @@ import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
 import { useLintStore } from "@/stores/lint-store"
 import { useChatStore } from "@/stores/chat-store"
+import { BASE_FONT_SIZE_PX, useZoomStore } from "@/stores/zoom-store"
 import { listDirectory, openProject } from "@/commands/fs"
-import { getLastProject, getRecentProjects, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig, loadEmbeddingConfig, loadMultimodalConfig, loadOutputLanguage, loadProviderConfigs, loadActivePresetId, loadProxyConfig, loadScheduledImportConfig, saveScheduledImportConfig, loadSourceWatchConfig, loadApiConfig, loadGeneralConfig } from "@/lib/project-store"
+import { getLastProject, getRecentProjects, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig, loadEmbeddingConfig, loadMineruConfig, loadMultimodalConfig, loadOutputLanguage, loadProviderConfigs, loadActivePresetId, loadProxyConfig, loadScheduledImportConfig, saveScheduledImportConfig, loadSourceWatchConfig, loadApiConfig, loadGeneralConfig, loadZoomLevel } from "@/lib/project-store"
 import { loadReviewItems, loadLintItems, loadChatHistory } from "@/lib/persist"
 import { setupAutoSave } from "@/lib/auto-save"
 import { startClipWatcher } from "@/lib/clip-watcher"
@@ -17,12 +18,17 @@ import { WelcomeScreen } from "@/components/project/welcome-screen"
 import { CreateProjectDialog } from "@/components/project/create-project-dialog"
 import type { WikiProject } from "@/types/wiki"
 
+function applyDocumentZoom(level: number) {
+  document.documentElement.style.fontSize = `${BASE_FONT_SIZE_PX * level}px`
+}
+
 function App() {
   const project = useWikiStore((s) => s.project)
   const setProject = useWikiStore((s) => s.setProject)
   const setFileTree = useWikiStore((s) => s.setFileTree)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
   const setActiveView = useWikiStore((s) => s.setActiveView)
+  const zoomLevel = useZoomStore((s) => s.level)
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [loading, setLoading] = useState(true)
 
@@ -31,6 +37,13 @@ function App() {
     setupAutoSave()
     startClipWatcher()
   }, [])
+
+  useEffect(() => {
+    // Apply interface zoom globally, including welcome/settings screens. We
+    // scale the rem base instead of using transform: scale() so layout and
+    // pointer coordinates remain native; fixed-pixel panels keep their caps.
+    applyDocumentZoom(zoomLevel)
+  }, [zoomLevel])
 
   // Dev-only helper for visually testing the update-banner UX.
   // Open dev tools and run:
@@ -179,6 +192,10 @@ function App() {
   useEffect(() => {
     async function init() {
       try {
+        const savedZoom = await loadZoomLevel()
+        applyDocumentZoom(savedZoom)
+        useZoomStore.getState().setLevel(savedZoom)
+
         const savedConfig = await loadLlmConfig()
         if (savedConfig) {
           useWikiStore.getState().setLlmConfig(savedConfig)
@@ -220,6 +237,11 @@ function App() {
         const savedMultimodalConfig = await loadMultimodalConfig()
         if (savedMultimodalConfig) {
           useWikiStore.getState().setMultimodalConfig(savedMultimodalConfig)
+        }
+
+        const savedMineruConfig = await loadMineruConfig()
+        if (savedMineruConfig) {
+          useWikiStore.getState().setMineruConfig(savedMineruConfig)
         }
         const savedProxy = await loadProxyConfig()
         if (savedProxy) {
@@ -285,140 +307,154 @@ function App() {
   }, [])
 
   async function handleProjectOpened(proj: WikiProject) {
-    // Clear all per-project state BEFORE loading new project data
-    // to prevent cross-project contamination. MUST be awaited so the
-    // ingest queue / graph cache are actually cleared before the new
-    // project's state is populated.
-    const { resetProjectState } = await import("@/lib/reset-project-state")
-    await resetProjectState()
+    // Flush the OUTGOING project's review/lint/chat state to disk and suspend
+    // auto-save before reset empties the stores — otherwise the debounced
+    // writers would persist empty arrays back over the old project's pending
+    // review / deep-research items.
+    const { runWithSuspendedAutoSave } = await import("@/lib/auto-save")
+    await runWithSuspendedAutoSave(async () => {
+      // Clear all per-project state BEFORE loading new project data
+      // to prevent cross-project contamination. MUST be awaited so the
+      // ingest queue / graph cache are actually cleared before the new
+      // project's state is populated.
+      const { resetProjectState } = await import("@/lib/reset-project-state")
+      await resetProjectState()
 
-    setProject(proj)
-    const projectOutputLang = await loadOutputLanguage(proj.id)
-    useWikiStore.getState().setOutputLanguage(projectOutputLang ?? "auto")
-    setSelectedFile(null)
-    setActiveView("wiki")
-    // Bump data version so any cached graphs/views invalidate
-    useWikiStore.getState().bumpDataVersion()
-    await saveLastProject(proj)
+      setProject(proj)
+      const projectOutputLang = await loadOutputLanguage(proj.id)
+      useWikiStore.getState().setOutputLanguage(projectOutputLang ?? "auto")
+      setSelectedFile(null)
+      setActiveView("wiki")
+      // Bump data version so any cached graphs/views invalidate
+      useWikiStore.getState().bumpDataVersion()
+      await saveLastProject(proj)
 
-    // Restore ingest queue (resume interrupted tasks). Keyed by the
-    // project's stable UUID so the queue still finds the right project
-    // even if the filesystem path changed since the task was enqueued.
-    // Await this before starting file sync: watcher events for raw/sources
-    // may enqueue ingest tasks and require an active project queue.
-    try {
-      const { restoreQueue } = await import("@/lib/ingest-queue")
-      await restoreQueue(proj.id, proj.path)
-    } catch (err) {
-      console.error("Failed to restore ingest queue:", err)
-    }
-    // Same handshake for the dedup-merge queue.
-    import("@/lib/dedup-queue").then(({ restoreQueue }) => {
-      restoreQueue(proj.id, proj.path).catch((err) =>
-        console.error("Failed to restore dedup queue:", err)
-      )
-    })
-    // Load per-project scheduled import config
-    try {
-      const savedScheduledImport = await loadScheduledImportConfig(proj.path)
-      if (savedScheduledImport) {
-        // Migrate relative path to absolute (backward compatibility)
-        let path = savedScheduledImport.path
-        if (path && !path.startsWith("/") && !path.match(/^[a-zA-Z]:[/\\]/)) {
-          path = `${proj.path}/${path}`
-        }
-        useWikiStore.getState().setScheduledImportConfig({
-          ...savedScheduledImport,
-          path,
-        })
-      } else {
-        // Reset to default for new projects
-        useWikiStore.getState().setScheduledImportConfig({
-          enabled: false,
-          path: `${proj.path}/raw/sources`,
-          interval: 60,
-          lastScan: null,
-        })
+      // Restore ingest queue (resume interrupted tasks). Keyed by the
+      // project's stable UUID so the queue still finds the right project
+      // even if the filesystem path changed since the task was enqueued.
+      // Await this before starting file sync: watcher events for raw/sources
+      // may enqueue ingest tasks and require an active project queue.
+      try {
+        const { restoreQueue } = await import("@/lib/ingest-queue")
+        await restoreQueue(proj.id, proj.path)
+      } catch (err) {
+        console.error("Failed to restore ingest queue:", err)
       }
-    } catch {
-      // ignore
-    }
-    // Start scheduled import if enabled
-    const scheduledImportConfig = useWikiStore.getState().scheduledImportConfig
-    if (scheduledImportConfig.enabled && scheduledImportConfig.path && scheduledImportConfig.interval > 0) {
-      import("@/lib/scheduled-import").then(({ startScheduledImport }) => {
-        startScheduledImport(proj, scheduledImportConfig)
-      }).catch((err) =>
-        console.error("Failed to start scheduled import:", err)
-      )
-    }
-
-    // Start project source watch if enabled
-    import("@/lib/project-file-sync").then(async ({ startProjectFileSync, stopProjectFileSync }) => {
-      const config = await loadSourceWatchConfig(proj.id)
-      useWikiStore.getState().setSourceWatchConfig(config)
-      if (config.enabled) {
-        startProjectFileSync(proj, config).catch((err) =>
-          console.error("Failed to start project file sync:", err)
+      // Same handshake for the dedup-merge queue.
+      import("@/lib/dedup-queue").then(({ restoreQueue }) => {
+        restoreQueue(proj.id, proj.path).catch((err) =>
+          console.error("Failed to restore dedup queue:", err)
         )
-      } else {
-        stopProjectFileSync().catch(() => {})
+      })
+      // Load per-project scheduled import config
+      try {
+        const savedScheduledImport = await loadScheduledImportConfig(proj.path)
+        if (savedScheduledImport) {
+          // Migrate relative path to absolute (backward compatibility)
+          let path = savedScheduledImport.path
+          if (path && !path.startsWith("/") && !path.match(/^[a-zA-Z]:[/\\]/)) {
+            path = `${proj.path}/${path}`
+          }
+          useWikiStore.getState().setScheduledImportConfig({
+            ...savedScheduledImport,
+            path,
+          })
+        } else {
+          // Reset to default for new projects
+          useWikiStore.getState().setScheduledImportConfig({
+            enabled: false,
+            path: `${proj.path}/raw/sources`,
+            interval: 60,
+            lastScan: null,
+          })
+        }
+      } catch {
+        // ignore
       }
-    }).catch((err) => console.error("Failed to configure project file sync:", err))
-    // Notify local clip server of the current project + all recent projects
-    fetch("http://127.0.0.1:19827/project", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: proj.path }),
-    }).catch(() => {})
+      // Start scheduled import if enabled
+      const scheduledImportConfig = useWikiStore.getState().scheduledImportConfig
+      if (scheduledImportConfig.enabled && scheduledImportConfig.path && scheduledImportConfig.interval > 0) {
+        import("@/lib/scheduled-import").then(({ startScheduledImport }) => {
+          startScheduledImport(proj, scheduledImportConfig)
+        }).catch((err) =>
+          console.error("Failed to start scheduled import:", err)
+        )
+      }
 
-    // Send all recent projects to clip server for extension project picker
-    getRecentProjects().then((recents) => {
-      const projects = recents.map((p) => ({ name: p.name, path: p.path }))
-      fetch("http://127.0.0.1:19827/projects", {
+      // Start project source watch if enabled
+      import("@/lib/project-file-sync").then(async ({ startProjectFileSync, stopProjectFileSync }) => {
+        const config = await loadSourceWatchConfig(proj.id)
+        useWikiStore.getState().setSourceWatchConfig(config)
+        if (config.enabled) {
+          startProjectFileSync(proj, config).catch((err) =>
+            console.error("Failed to start project file sync:", err)
+          )
+        } else {
+          stopProjectFileSync().catch(() => {})
+        }
+      }).catch((err) => console.error("Failed to configure project file sync:", err))
+      // Notify local clip server of the current project + all recent projects
+      fetch("http://127.0.0.1:19827/project", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projects }),
+        body: JSON.stringify({ path: proj.path }),
       }).catch(() => {})
-    }).catch(() => {})
-    try {
-      const tree = await listDirectory(proj.path)
-      setFileTree(tree)
-    } catch (err) {
-      console.error("Failed to load file tree:", err)
-    }
-    // Load persisted review items
-    try {
-      const savedReview = await loadReviewItems(proj.path)
-      if (savedReview.length > 0) {
-        useReviewStore.getState().setItems(savedReview)
+
+      // Send all recent projects to clip server for extension project picker
+      getRecentProjects().then((recents) => {
+        const projects = recents.map((p) => ({ name: p.name, path: p.path }))
+        fetch("http://127.0.0.1:19827/projects", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projects }),
+        }).catch(() => {})
+      }).catch(() => {})
+      try {
+        const tree = await listDirectory(proj.path)
+        setFileTree(tree)
+      } catch (err) {
+        console.error("Failed to load file tree:", err)
       }
-    } catch {
-      // ignore, start fresh
-    }
-    // Load persisted lint items
-    useLintStore.getState().setItems([])
-    try {
-      const savedLint = await loadLintItems(proj.path)
-      useLintStore.getState().setItems(savedLint)
-    } catch {
-      useLintStore.getState().setItems([])
-    }
-    // Load persisted chat history
-    try {
-      const savedChat = await loadChatHistory(proj.path)
-      if (savedChat.conversations.length > 0) {
-        useChatStore.getState().setConversations(savedChat.conversations)
-        useChatStore.getState().setMessages(savedChat.messages)
-        // Set most recent conversation as active
-        const sorted = [...savedChat.conversations].sort((a, b) => b.updatedAt - a.updatedAt)
-        if (sorted[0]) {
-          useChatStore.getState().setActiveConversation(sorted[0].id)
+      // Load persisted review items
+      try {
+        const savedReview = await loadReviewItems(proj.path)
+        if (savedReview.length > 0) {
+          useReviewStore.getState().setItems(savedReview)
         }
+      } catch {
+        // ignore, start fresh
       }
-    } catch {
-      // ignore, start fresh
-    }
+      // Load persisted lint items
+      useLintStore.getState().setItems([])
+      try {
+        const savedLint = await loadLintItems(proj.path)
+        useLintStore.getState().setItems(savedLint)
+      } catch {
+        useLintStore.getState().setItems([])
+      }
+      // Load persisted chat history
+      try {
+        const savedChat = await loadChatHistory(proj.path)
+        if (savedChat.conversations.length > 0) {
+          useChatStore.getState().setConversations(savedChat.conversations)
+          useChatStore.getState().setMessages(savedChat.messages)
+          // Set most recent conversation as active
+          const sorted = [...savedChat.conversations].sort((a, b) => b.updatedAt - a.updatedAt)
+          if (sorted[0]) {
+            useChatStore.getState().setActiveConversation(sorted[0].id)
+          }
+        }
+      } catch {
+        // ignore, start fresh
+      }
+    }, () => {
+      // If project loading fails after resetProjectState() and before persisted
+      // review/lint/chat state has been restored, do not leave auto-save armed
+      // against a half-loaded project with empty stores.
+      setProject(null)
+      setFileTree([])
+      setSelectedFile(null)
+    })
   }
 
   async function handleSelectRecent(proj: WikiProject) {
@@ -457,6 +493,12 @@ function App() {
       const currentConfig = useWikiStore.getState().scheduledImportConfig
       saveScheduledImportConfig(currentProject.path, currentConfig).catch(() => {})
     }
+
+    // Flush outgoing project's review/lint/chat to disk and suspend auto-save
+    // before reset empties the stores. resumeAutoSave() runs when the next
+    // project opens via handleProjectOpened.
+    const { flushAndSuspendAutoSave } = await import("@/lib/auto-save")
+    await flushAndSuspendAutoSave()
 
     // Clear all per-project state BEFORE flipping back to the welcome screen
     // so old data cannot leak in via any async render pass.

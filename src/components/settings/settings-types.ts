@@ -1,5 +1,5 @@
 import type { CustomApiMode } from "./llm-presets"
-import type { AzureModelFamily, CloseBehavior, ReasoningConfig, SourceWatchConfig } from "@/stores/wiki-store"
+import type { AzureModelFamily, CloseBehavior, MineruModelVersion, ReasoningConfig, SourceWatchConfig } from "@/stores/wiki-store"
 
 /**
  * Shape of the draft state each section reads from and writes into.
@@ -19,6 +19,7 @@ export interface SettingsDraft {
   maxContextSize: number
   apiMode: CustomApiMode | undefined
   reasoning: ReasoningConfig | undefined
+  localCliIsolation: boolean
 
   // Embedding
   embeddingEnabled: boolean
@@ -66,6 +67,7 @@ export interface SettingsDraft {
   // UI
   uiLanguage: string
   theme: "light" | "dark" | "system"
+  zoomLevel: number
 
   // General app behavior
   autostart: boolean
@@ -73,6 +75,11 @@ export interface SettingsDraft {
 
   // Source folder auto watch
   sourceWatchConfig: SourceWatchConfig
+
+  // MinerU PDF parsing
+  mineruEnabled: boolean
+  mineruToken: string
+  mineruModelVersion: MineruModelVersion
 
   // Local HTTP API server
   apiEnabled: boolean

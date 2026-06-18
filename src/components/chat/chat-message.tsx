@@ -20,12 +20,15 @@ import { convertLatexToUnicode } from "@/lib/latex-to-unicode"
 import { normalizePath, getFileName } from "@/lib/path-utils"
 import { makeQueryFileName } from "@/lib/wiki-filename"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
+import { messageImageToDataUrl } from "@/lib/chat-image-utils"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
+import { transformImageEmbeds } from "@/lib/wikilink-transform"
 import { findRawSourceForImage, imageUrlToAbsolute } from "@/lib/raw-source-resolver"
 import { detectLanguage } from "@/lib/detect-language"
 import { getHtmlLang, getTextDirection } from "@/lib/language-metadata"
 import { MermaidDiagram, unwrapMermaidPre } from "@/components/mermaid-diagram"
 import { inferWikiTypeFromPath } from "@/lib/wiki-page-types"
+import { cleanAssistantContentForWikiSave, titleFromCleanAssistantContent } from "@/lib/chat-save-to-wiki"
 
 // Module-level cache of source file names
 let cachedSourceFiles: string[] = []
@@ -90,19 +93,34 @@ function ChatMessageImpl({ message, isLastAssistant, onRegenerate }: ChatMessage
         {isUser ? <User className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
       </div>
       <div className="max-w-[80%] flex flex-col gap-1.5">
-        <div
-          className={`rounded-lg px-3 py-2 text-sm ${
-            isUser
-              ? "bg-primary text-primary-foreground"
-              : "bg-muted text-foreground"
-          }`}
-        >
-          {isUser ? (
-            <p dir="auto" className="whitespace-pre-wrap break-words">{message.content}</p>
-          ) : (
-            <MarkdownContent content={message.content} />
-          )}
-        </div>
+        {isUser && message.images && message.images.length > 0 && (
+          <div className={`flex flex-wrap gap-1.5 ${isUser ? "justify-end" : ""}`}>
+            {message.images.map((img, i) => (
+              <img
+                key={i}
+                src={messageImageToDataUrl(img)}
+                alt=""
+                className="max-h-40 max-w-[180px] rounded-lg border border-border/40 object-contain"
+                loading="lazy"
+              />
+            ))}
+          </div>
+        )}
+        {(!isUser || message.content) && (
+          <div
+            className={`rounded-lg px-3 py-2 text-sm ${
+              isUser
+                ? "bg-primary text-primary-foreground"
+                : "bg-muted text-foreground"
+            }`}
+          >
+            {isUser ? (
+              <p dir="auto" className="whitespace-pre-wrap break-words">{message.content}</p>
+            ) : (
+              <MarkdownContent content={message.content} />
+            )}
+          </div>
+        )}
         {isAssistant && <CitedReferencesPanel content={message.content} savedReferences={message.references} />}
         {isAssistant && hovered && (
           <div className="flex items-center gap-1">
@@ -175,17 +193,10 @@ function SaveToWikiButton({ content, visible }: { content: string; visible: bool
       // See `src/lib/wiki-filename.ts` — the slug is Unicode-aware
       // (so CJK titles don't collapse to empty) and the HHMMSS
       // timestamp suffix guarantees same-day saves stay distinct.
-      const firstLine = content.split("\n")[0].replace(/^#+\s*/, "").trim()
-      const title = firstLine.slice(0, 60) || "Saved Query"
+      const cleanContent = cleanAssistantContentForWikiSave(content)
+      const title = titleFromCleanAssistantContent(cleanContent)
       const { date, fileName } = makeQueryFileName(title)
       const filePath = `${pp}/wiki/queries/${fileName}`
-
-      // Strip hidden sources comment and thinking blocks from content
-      const cleanContent = content
-        .replace(/<!--\s*sources:.*?-->/g, "")
-        .replace(/<think(?:ing)?>\s*[\s\S]*?<\/think(?:ing)?>\s*/gi, "")
-        .replace(/<think(?:ing)?>\s*[\s\S]*$/gi, "")
-        .trimEnd()
 
       const frontmatter = [
         "---",
@@ -337,8 +348,7 @@ interface CitedImageInfo {
 
 function CitedReferencesPanel({ content, savedReferences }: { content: string; savedReferences?: CitedPage[] }) {
   const project = useWikiStore((s) => s.project)
-  const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
-  const setFileContent = useWikiStore((s) => s.setFileContent)
+  const openFileInPreview = useWikiStore((s) => s.openFileInPreview)
   const setExternalPreview = useWikiStore((s) => s.setExternalPreview)
   const setPendingScrollImageSrc = useWikiStore((s) => s.setPendingScrollImageSrc)
   const [expanded, setExpanded] = useState(false)
@@ -432,8 +442,7 @@ function CitedReferencesPanel({ content, savedReferences }: { content: string; s
         try {
           const content = await readFile(rawPath)
           setPendingScrollImageSrc(imageUrlToAbsolute(firstUrl, pp))
-          setSelectedFile(rawPath)
-          setFileContent(content)
+          openFileInPreview(rawPath, content)
           console.log(`[refs:image-jump] ${firstUrl} → raw source ${rawPath}`)
           return
         } catch (err) {
@@ -446,13 +455,12 @@ function CitedReferencesPanel({ content, savedReferences }: { content: string; s
       try {
         const content = await readFile(`${pp}/${fallbackPath}`)
         setPendingScrollImageSrc(firstUrl)
-        setSelectedFile(`${pp}/${fallbackPath}`)
-        setFileContent(content)
+        openFileInPreview(`${pp}/${fallbackPath}`, content)
       } catch (err) {
         console.warn(`[refs:image-jump] fallback also failed:`, err)
       }
     },
-    [project, setPendingScrollImageSrc, setSelectedFile, setFileContent],
+    [project, setPendingScrollImageSrc, openFileInPreview],
   )
 
   if (citedPages.length === 0) return null
@@ -499,8 +507,7 @@ function CitedReferencesPanel({ content, savedReferences }: { content: string; s
                   "",
                   page.snippet?.trim() || "(No fragment returned by AnyTXT.)",
                 ].join("\n")
-                setSelectedFile(previewPath)
-                setFileContent(previewContent)
+                openFileInPreview(previewPath, previewContent)
                 setExternalPreview({
                   title: page.title,
                   path: previewPath,
@@ -532,14 +539,14 @@ function CitedReferencesPanel({ content, savedReferences }: { content: string; s
             ]
             for (const candidate of candidates) {
               try {
-                await readFile(candidate)
-                setSelectedFile(candidate)
+                const content = await readFile(candidate)
+                openFileInPreview(candidate, content)
                 return
               } catch {
                 // try next
               }
             }
-            setSelectedFile(`${pp}/${page.path}`)
+            openFileInPreview(`${pp}/${page.path}`, `Unable to load: ${page.path}`)
           }
           return (
             // Outer is a div, NOT a button — we have two click
@@ -899,6 +906,12 @@ function ThinkingBlock({ content }: { content: string }) {
 function processContent(text: string): string {
   let result = text
 
+  // Rewrite Obsidian image embeds (`![[…]]`) into standard markdown
+  // FIRST — before the `[[…]]` → wikilink conversion below, which
+  // would otherwise mangle the embed target into a broken
+  // `wikilink:` image. Same rule the wiki reader / raw preview use.
+  result = transformImageEmbeds(result)
+
   // Wrap bare \begin{...}...\end{...} blocks with $$ for remark-math
   result = result.replace(
     /(?<!\$\$\s*)(\\begin\{[^}]+\}[\s\S]*?\\end\{[^}]+\})(?!\s*\$\$)/g,
@@ -932,9 +945,7 @@ function processContent(text: string): string {
 
 function WikiLink({ pageName, children }: { pageName: string; children: React.ReactNode }) {
   const project = useWikiStore((s) => s.project)
-  const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
-  const setFileContent = useWikiStore((s) => s.setFileContent)
-  const setActiveView = useWikiStore((s) => s.setActiveView)
+  const openFileInPreview = useWikiStore((s) => s.openFileInPreview)
   const [exists, setExists] = useState<boolean | null>(null)
   const resolvedPath = useRef<string | null>(null)
 
@@ -975,13 +986,11 @@ function WikiLink({ pageName, children }: { pageName: string; children: React.Re
     if (!resolvedPath.current) return
     try {
       const content = await readFile(resolvedPath.current)
-      setSelectedFile(resolvedPath.current)
-      setFileContent(content)
-      setActiveView("wiki")
+      openFileInPreview(resolvedPath.current, content)
     } catch {
       // ignore
     }
-  }, [setSelectedFile, setFileContent, setActiveView])
+  }, [openFileInPreview])
 
   if (exists === false) {
     return (

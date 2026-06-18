@@ -26,6 +26,72 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.4.24",
+    date: "2026-06-16",
+    highlights: {
+      en: [
+        "Improved project creation visibility, lint repair suggestions, zoom controls, autosave, and review persistence across project switches.",
+        "Fixed vector index cleanup, Unicode page IDs, duplicate scan prefiltering, and local embedding requests so indexes and rebuilds stay accurate.",
+        "Improved MCP and local CLI provider reliability, including MCP version reporting and running Codex CLI from the project root.",
+        "Improved language prompts so technical names, model names, tool names, and code identifiers are preserved more reliably.",
+        "Hardened Windows startup with a native title bar, earlier API startup, and a visible startup-error fallback instead of a blank window.",
+      ],
+      zh: [
+        "改进项目创建字段可见性、检查修复建议、缩放控制、自动保存，以及切换项目后的待审阅项保留。",
+        "修复向量索引清理、Unicode 页面 ID、重复扫描预筛选和本地 Embedding 请求，确保索引与重建结果更准确。",
+        "改进 MCP 与本地 CLI Provider 稳定性，包括 MCP 版本显示，以及从项目根目录运行 Codex CLI。",
+        "改进语言提示词，更可靠地保留技术名、模型名、工具名和代码标识符。",
+        "增强 Windows 启动稳定性：使用原生标题栏、提前启动 API，并在前端启动失败时显示错误信息而不是白屏。",
+      ],
+    },
+  },
+  {
+    version: "0.4.23",
+    date: "2026-06-08",
+    highlights: {
+      en: [
+        "Added Doubao embedding compatibility and improved embedding rebuild safety.",
+        "Fixed dedup scan hangs, Codex CLI PATH detection from login shells, and several ingest / scheduled import reliability issues.",
+      ],
+      zh: [
+        "新增 Doubao Embedding 兼容，并提升 Embedding 重建过程的安全性。",
+        "修复去重扫描卡住、Codex CLI 登录 shell PATH 检测，以及多处摄取和定时导入稳定性问题。",
+      ],
+    },
+  },
+  {
+    version: "0.4.22",
+    date: "2026-06-08",
+    highlights: {
+      en: [
+        "Improved MinerU PDF previews by extracting images from MinerU result archives and rewriting them into Markdown image links.",
+        "Converted MinerU HTML tables inside Markdown output into Markdown tables for cleaner preview and ingest.",
+        "Hardened MinerU image handling for spaces, parentheses, path traversal, duplicate names, and partial image-save failures.",
+      ],
+      zh: [
+        "改进 MinerU PDF 预览：从 MinerU 结果压缩包提取图片，并重写为 Markdown 图片引用。",
+        "将 MinerU Markdown 输出中的 HTML 表格转换为 Markdown 表格，让预览和摄取更干净。",
+        "强化 MinerU 图片处理，覆盖空格、括号、路径穿越、重名图片和图片保存部分失败等边界。",
+      ],
+    },
+  },
+  {
+    version: "0.4.21",
+    date: "2026-06-07",
+    highlights: {
+      en: [
+        "Improved chat image support with safer local image handling, MiniMax M3 provider compatibility, and GLM vision model compatibility.",
+        "Improved MinerU PDF parsing, local CLI provider resolution, API/MCP settings, and source/image ingestion reliability.",
+        "Closed a batch of fixed GitHub issues covering source monitoring, scrolling, long-document ingest, editing, and provider compatibility.",
+      ],
+      zh: [
+        "改进 AI 对话图片支持，增强本地图片处理安全性，并扩展 MiniMax M3 Provider 与 GLM 多模态模型兼容。",
+        "优化 MinerU PDF 解析、本地 CLI Provider 解析、API/MCP 设置，以及资料与图片摄取稳定性。",
+        "集中处理并关闭一批已修复的 GitHub issue，覆盖资料监控、滚动、长文档摄取、编辑保存和 Provider 兼容。",
+      ],
+    },
+  },
+  {
     version: "0.4.20",
     date: "2026-06-04",
     highlights: {

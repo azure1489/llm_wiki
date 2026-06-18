@@ -112,6 +112,41 @@ describe("source-lifecycle path helpers", () => {
     ])
   })
 
+  it("rejects importing the project folder or folders inside it", async () => {
+    await expect(
+      importSourceFolder(
+        { id: "p1", name: "Project", path: "/project" },
+        "/project",
+        {
+          provider: "openai",
+          endpoint: "https://api.example.com/v1",
+          apiKey: "key",
+          model: "model",
+          customModel: "",
+          reasoning: { enabled: false, effort: "low" },
+        } as never,
+      ),
+    ).rejects.toThrow("Cannot import the project folder")
+
+    await expect(
+      importSourceFolder(
+        { id: "p1", name: "Project", path: "/project" },
+        "/project/raw/sources",
+        {
+          provider: "openai",
+          endpoint: "https://api.example.com/v1",
+          apiKey: "key",
+          model: "model",
+          customModel: "",
+          reasoning: { enabled: false, effort: "low" },
+        } as never,
+      ),
+    ).rejects.toThrow("Cannot import the project folder")
+
+    expect(mocks.listDirectory).not.toHaveBeenCalled()
+    expect(mocks.copyFile).not.toHaveBeenCalled()
+  })
+
   it("filters single-file imports using the original source path before copying", async () => {
     const copied = await importSourceFiles(
       { id: "p1", name: "Project", path: "/project" },
