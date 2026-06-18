@@ -83,6 +83,16 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ./src-tauri/target/release/bundle/deb/*.deb \
     && rm -rf /var/lib/apt/lists/*
 
+# 字体：基础镜像无 CJK/印地语等字体，WebView 渲染中日韩文会变成豆腐块（□）。
+# 放在编译层之后单独成层，避免使昂贵的 Rust 编译缓存失效（重建只需几十秒）。
+#   fonts-noto-cjk        简繁中文/日文/韩文
+#   fonts-noto-core       Devanagari(印地语) 等大量脚本
+#   fonts-noto-color-emoji 彩色 emoji
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fonts-noto-cjk fonts-noto-core fonts-noto-color-emoji \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
+
 # pdfium 兜底：把仓库自带的 x86-64 libpdfium.so 放到固定路径，
 # 通过 PDFIUM_DYNAMIC_LIB_PATH 让 fs.rs 的加载器优先命中，避免 deb 资源布局差异。
 RUN cp /app/src-tauri/pdfium/libpdfium.so /usr/local/lib/libpdfium.so && ldconfig
