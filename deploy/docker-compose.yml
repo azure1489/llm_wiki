@@ -31,6 +31,8 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /root/.Xauthority:/root/.Xauthority:ro
       - /opt/llm-wiki-data:/data
+      # 项目目录：宿主与容器同路径，应用里到此路径新建/打开项目，数据持久在宿主。
+      - /opt/llm-wiki/data1:/opt/llm-wiki/data1
 
   wiki2:
     image: llm-wiki:local
@@ -53,3 +55,26 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /root/.Xauthority:/root/.Xauthority:ro
       - /opt/llm-wiki-data-2:/data
+      # 项目目录：宿主与容器同路径，应用里到此路径新建/打开项目，数据持久在宿主。
+      - /opt/llm-wiki/data2:/opt/llm-wiki/data2
+
+  wiki3:
+    image: llm-wiki:local
+    container_name: llm-wiki-3
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      DISPLAY: ":1"
+      XAUTHORITY: /root/.Xauthority
+      LLM_WIKI_API_HOST: "127.0.0.1"
+      LLM_WIKI_API_PORT: "20028"
+      LLM_WIKI_CLIP_PORT: "20027"
+      LLM_WIKI_API_TOKEN: "${WIKI3_TOKEN}"
+      WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+      WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /root/.Xauthority:/root/.Xauthority:ro
+      - /opt/llm-wiki-data-3:/data
+      - /opt/llm-wiki/data3:/opt/llm-wiki/data3
