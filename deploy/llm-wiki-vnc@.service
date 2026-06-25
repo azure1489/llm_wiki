@@ -1,0 +1,12 @@
+[Unit]
+Description=LLM Wiki extra VNC desktop %i (Xvnc + xfwm4)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/root/llm_wiki/deploy/vnc-extra.sh %i
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -10,11 +10,32 @@ static PENDING_CLIPS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new()); // 
 /// Daemon status: 0=starting, 1=running, 2=port_conflict, 3=error
 static DAEMON_STATUS: AtomicU8 = AtomicU8::new(0);
 
-const PORT: u16 = 19827;
+const DEFAULT_PORT: u16 = 19827;
+const DEFAULT_HOST: &str = "127.0.0.1";
 const MAX_BIND_RETRIES: u32 = 3;
 const MAX_RESTART_RETRIES: u32 = 10;
 const BIND_RETRY_DELAY_SECS: u64 = 2;
 const RESTART_DELAY_SECS: u64 = 5;
+
+/// Bind host for the clip server. Defaults to loopback. The clip endpoint is
+/// unauthenticated (it writes files into project dirs), so it should stay on
+/// 127.0.0.1 — `LLM_WIKI_CLIP_HOST` exists only for parity, not public exposure.
+fn bind_host() -> String {
+    std::env::var("LLM_WIKI_CLIP_HOST")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_HOST.to_string())
+}
+
+/// Listen port for the clip server. Defaults to 19827; override with
+/// `LLM_WIKI_CLIP_PORT` so several instances can coexist on one host.
+fn bind_port() -> u16 {
+    std::env::var("LLM_WIKI_CLIP_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
 
 /// Get current daemon status as a string
 pub fn get_daemon_status() -> &'static str {
@@ -46,11 +67,12 @@ pub fn start_clip_server() {
 
         loop {
             // Try to bind the port with retries
+            let addr = format!("{}:{}", bind_host(), bind_port());
             let server = {
                 let mut last_err = String::new();
                 let mut bound = None;
                 for attempt in 1..=MAX_BIND_RETRIES {
-                    match Server::http(format!("127.0.0.1:{}", PORT)) {
+                    match Server::http(addr.as_str()) {
                         Ok(s) => {
                             bound = Some(s);
                             break;
@@ -73,8 +95,8 @@ pub fn start_clip_server() {
                     Some(s) => s,
                     None => {
                         eprintln!(
-                            "[Clip Server] Port {} unavailable after {} attempts: {}",
-                            PORT, MAX_BIND_RETRIES, last_err
+                            "[Clip Server] {} unavailable after {} attempts: {}",
+                            addr, MAX_BIND_RETRIES, last_err
                         );
                         DAEMON_STATUS.store(2, Ordering::Relaxed); // port_conflict
                         return; // Don't retry on port conflict — needs user action
@@ -84,7 +106,7 @@ pub fn start_clip_server() {
 
             DAEMON_STATUS.store(1, Ordering::Relaxed); // running
             restart_count = 0; // Reset on successful bind
-            println!("[Clip Server] Listening on http://127.0.0.1:{}", PORT);
+            println!("[Clip Server] Listening on http://{}", addr);
 
             for mut request in server.incoming_requests() {
                 let cors_headers = vec![

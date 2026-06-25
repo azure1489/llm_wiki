@@ -1,0 +1,55 @@
+# 多实例 LLM Wiki —— 同一镜像跑多个互相隔离的实例。
+#
+# 隔离要点（详见 deploy/MULTI.md）：
+#  - 端口：每实例 API/CLIP 用不同端口（源码已支持 LLM_WIKI_API_PORT / LLM_WIKI_CLIP_PORT）。
+#  - 数据：每实例独立数据卷（HOME=/data），互不覆盖。
+#  - 显示：每实例独立 VNC 桌面（:1 由系统自带；:2 由 llm-wiki-vnc@2.service 提供）。
+#  - 暴露：API 绑 127.0.0.1，由宿主 socat 转发到公网端口（llm-wiki-proxy.service）；
+#          CLIP 无鉴权，仅本机，不对外。
+#
+# token 从同目录 .env 读取（见 .env.example）。启动：
+#   docker rm -f llm-wiki 2>/dev/null   # 移除旧的单实例容器（首次迁移时）
+#   docker compose -f deploy/docker-compose.yml up -d
+
+services:
+  wiki1:
+    image: llm-wiki:local
+    container_name: llm-wiki-1
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      DISPLAY: ":1"
+      XAUTHORITY: /root/.Xauthority
+      LLM_WIKI_API_HOST: "127.0.0.1"
+      LLM_WIKI_API_PORT: "19828"
+      LLM_WIKI_CLIP_PORT: "19827"
+      LLM_WIKI_API_TOKEN: "${WIKI1_TOKEN}"
+      WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+      WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /root/.Xauthority:/root/.Xauthority:ro
+      - /opt/llm-wiki-data:/data
+
+  wiki2:
+    image: llm-wiki:local
+    container_name: llm-wiki-2
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # 与实例 #1 共用桌面 :1（连 VNC 5901 即可同时看到两个窗口）。
+      # 若想各占独立桌面，改回 ":2" 并启用 llm-wiki-vnc@2.service。
+      DISPLAY: ":1"
+      XAUTHORITY: /root/.Xauthority
+      LLM_WIKI_API_HOST: "127.0.0.1"
+      LLM_WIKI_API_PORT: "19928"
+      LLM_WIKI_CLIP_PORT: "19927"
+      LLM_WIKI_API_TOKEN: "${WIKI2_TOKEN}"
+      WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+      WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /root/.Xauthority:/root/.Xauthority:ro
+      - /opt/llm-wiki-data-2:/data

@@ -15,8 +15,31 @@ use walkdir::WalkDir;
 
 use crate::{clip_server, commands};
 
-const PORT: u16 = 19828;
+const DEFAULT_PORT: u16 = 19828;
+const DEFAULT_HOST: &str = "127.0.0.1";
 const API_PREFIX: &str = "/api/v1";
+
+/// Bind host for the local API server. Defaults to loopback; override with
+/// `LLM_WIKI_API_HOST` (e.g. `0.0.0.0`) when fronting multiple instances —
+/// though the recommended exposure is a socat/reverse-proxy in front of a
+/// loopback bind, since the bundled MCP/HTTP API is token-gated but the
+/// surface is still best kept off public interfaces by default.
+fn bind_host() -> String {
+    std::env::var("LLM_WIKI_API_HOST")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_HOST.to_string())
+}
+
+/// Listen port for the local API server. Defaults to 19828; override with
+/// `LLM_WIKI_API_PORT` so several instances can coexist on one host.
+fn bind_port() -> u16 {
+    std::env::var("LLM_WIKI_API_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_FILE_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_MAX_FILES: usize = 2_000;
@@ -73,7 +96,11 @@ pub fn start_api_server(app: AppHandle) {
         };
 
         API_STATUS.store(1, Ordering::Relaxed);
-        eprintln!("[API Server] Listening on http://127.0.0.1:{PORT}{API_PREFIX}");
+        eprintln!(
+            "[API Server] Listening on http://{}:{}{API_PREFIX}",
+            bind_host(),
+            bind_port()
+        );
 
         for request in server.incoming_requests() {
             let method = request.method().clone();
@@ -105,12 +132,13 @@ pub fn start_api_server(app: AppHandle) {
 }
 
 fn bind_server_with_retry() -> Option<Server> {
+    let addr = format!("{}:{}", bind_host(), bind_port());
     for attempt in 1..=MAX_BIND_RETRIES {
-        match Server::http(format!("127.0.0.1:{PORT}")) {
+        match Server::http(addr.as_str()) {
             Ok(server) => return Some(server),
             Err(err) => {
                 eprintln!(
-                    "[API Server] Failed to bind 127.0.0.1:{PORT} (attempt {attempt}/{MAX_BIND_RETRIES}): {err}"
+                    "[API Server] Failed to bind {addr} (attempt {attempt}/{MAX_BIND_RETRIES}): {err}"
                 );
                 if attempt < MAX_BIND_RETRIES {
                     thread::sleep(Duration::from_secs(BIND_RETRY_DELAY_SECS));
