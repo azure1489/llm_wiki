@@ -6,6 +6,7 @@ import {
   computeIngestGenerationMaxTokens,
   computeIngestReviewMaxTokens,
   computeIngestSourceBudget,
+  formatIngestWarningLogEntry,
   splitSourceIntoSemanticChunks,
 } from "./ingest"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -52,6 +53,39 @@ describe("buildAnalysisPrompt language directive", () => {
     const prompt = buildAnalysisPrompt("", "", "")
     expect(prompt).toContain("Which named subject is each claim about")
     expect(prompt).toContain("Do not transfer claims, limits, or evaluations")
+  })
+
+  it("injects the project schema so analysis can recommend custom-typed pages", () => {
+    const schema = "## Page Types\n| goal | wiki/goals/ | Outcomes |\n| habit | wiki/habits/ | Behaviours |"
+    const prompt = buildAnalysisPrompt("", "", "", schema)
+    expect(prompt).toContain("## Project Schema")
+    expect(prompt).toContain("wiki/goals/")
+    // Recommendations guidance must mention schema-defined types
+    expect(prompt).toContain("goal, habit")
+  })
+
+  it("omits the schema section when no schema is provided", () => {
+    const prompt = buildAnalysisPrompt("", "", "")
+    expect(prompt).not.toContain("## Project Schema")
+  })
+
+  it("does not invent schema content not present in the source", () => {
+    const prompt = buildAnalysisPrompt("", "", "", "| goal | wiki/goals/ | x |")
+    expect(prompt).toContain("never invent")
+  })
+})
+
+describe("ingest warning log formatting", () => {
+  it("records all warnings with timestamp and source identity", () => {
+    const entry = formatIngestWarningLogEntry(
+      "book.pdf",
+      ["FILE block was truncated", "Aggregate repair failed"],
+      new Date("2026-06-30T01:02:03.000Z"),
+    )
+
+    expect(entry).toContain("## 2026-06-30T01:02:03.000Z | book.pdf")
+    expect(entry).toContain("1. FILE block was truncated")
+    expect(entry).toContain("2. Aggregate repair failed")
   })
 })
 

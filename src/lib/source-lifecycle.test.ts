@@ -30,6 +30,7 @@ vi.mock("@/lib/ingest-queue", () => ({
 }))
 
 import {
+  enqueueSourceIngest,
   folderContextForSourcePath,
   importSourceFiles,
   importSourceFolder,
@@ -112,6 +113,59 @@ describe("source-lifecycle path helpers", () => {
     ])
   })
 
+  it("does not import config-like files from hidden tool folders", async () => {
+    mocks.listDirectory.mockResolvedValue([
+      {
+        name: ".claude",
+        path: "/external/imported/.claude",
+        is_dir: true,
+        children: [
+          { name: "settings.json", path: "/external/imported/.claude/settings.json", is_dir: false },
+          { name: "research.md", path: "/external/imported/.claude/research.md", is_dir: false },
+        ],
+      },
+      {
+        name: ".codex",
+        path: "/external/imported/.codex",
+        is_dir: true,
+        children: [
+          { name: "config.yaml", path: "/external/imported/.codex/config.yaml", is_dir: false },
+        ],
+      },
+    ])
+
+    const copied = await importSourceFolder(
+      { id: "p1", name: "Project", path: "/project" },
+      "/external/imported",
+      {
+        provider: "openai",
+        endpoint: "https://api.example.com/v1",
+        apiKey: "key",
+        model: "model",
+        customModel: "",
+        reasoning: { enabled: false, effort: "low" },
+      } as never,
+      {
+        enabled: true,
+        autoIngest: true,
+        includeExtensions: ["json", "yaml", "md"],
+        excludeExtensions: [],
+        excludeDirs: [],
+        excludeGlobs: [],
+        maxFileSizeMb: 100,
+      },
+    )
+
+    expect(copied).toEqual(["/project/raw/sources/imported/.claude/research.md"])
+    expect(mocks.copyFile).toHaveBeenCalledTimes(1)
+    expect(mocks.copyFile).toHaveBeenCalledWith(
+      "/external/imported/.claude/research.md",
+      "/project/raw/sources/imported/.claude/research.md",
+    )
+    expect(mocks.copyFile).not.toHaveBeenCalledWith("/external/imported/.claude/settings.json", expect.anything())
+    expect(mocks.copyFile).not.toHaveBeenCalledWith("/external/imported/.codex/config.yaml", expect.anything())
+  })
+
   it("rejects importing the project folder or folders inside it", async () => {
     await expect(
       importSourceFolder(
@@ -178,6 +232,83 @@ describe("source-lifecycle path helpers", () => {
       {
         sourcePath: "/project/raw/sources/ready.md",
         folderContext: "",
+      },
+    ])
+  })
+
+  it("skips sensitive tool config files at the shared ingest enqueue boundary", async () => {
+    const queued = await enqueueSourceIngest(
+      { id: "p1", name: "Project", path: "/project" },
+      [
+        "/project/raw/sources/.claude/settings.json",
+        "/project/raw/sources/.codex/config.yaml",
+        "/project/raw/sources/notes.md",
+      ],
+      {
+        provider: "openai",
+        endpoint: "https://api.example.com/v1",
+        apiKey: "key",
+        model: "model",
+        customModel: "",
+        reasoning: { enabled: false, effort: "low" },
+      } as never,
+    )
+
+    expect(queued).toEqual(["task"])
+    expect(mocks.enqueueBatch).toHaveBeenCalledWith("p1", [
+      {
+        sourcePath: "/project/raw/sources/notes.md",
+        folderContext: "",
+      },
+    ])
+  })
+
+  it("naturally orders imported folder files before enqueueing ingest tasks", async () => {
+    mocks.listDirectory.mockResolvedValue([
+      { name: "10.md", path: "/external/imported/10.md", is_dir: false },
+      { name: "2.md", path: "/external/imported/2.md", is_dir: false },
+      { name: "1.md", path: "/external/imported/1.md", is_dir: false },
+    ])
+
+    const copied = await importSourceFolder(
+      { id: "p1", name: "Project", path: "/project" },
+      "/external/imported",
+      {
+        provider: "openai",
+        endpoint: "https://api.example.com/v1",
+        apiKey: "key",
+        model: "model",
+        customModel: "",
+        reasoning: { enabled: false, effort: "low" },
+      } as never,
+      {
+        enabled: true,
+        autoIngest: true,
+        includeExtensions: ["md"],
+        excludeExtensions: [],
+        excludeDirs: [],
+        excludeGlobs: [],
+        maxFileSizeMb: 100,
+      },
+    )
+
+    expect(copied).toEqual([
+      "/project/raw/sources/imported/1.md",
+      "/project/raw/sources/imported/2.md",
+      "/project/raw/sources/imported/10.md",
+    ])
+    expect(mocks.enqueueBatch).toHaveBeenCalledWith("p1", [
+      {
+        sourcePath: "/project/raw/sources/imported/1.md",
+        folderContext: "imported",
+      },
+      {
+        sourcePath: "/project/raw/sources/imported/2.md",
+        folderContext: "imported",
+      },
+      {
+        sourcePath: "/project/raw/sources/imported/10.md",
+        folderContext: "imported",
       },
     ])
   })

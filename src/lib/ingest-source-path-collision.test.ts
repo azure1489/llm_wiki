@@ -110,14 +110,15 @@ vi.mock("./llm-client", () => ({
 
 vi.mock("./mineru", () => ({
   parseWithMineru: vi.fn(),
+  parseWithMineruResult: vi.fn(),
 }))
 
 import { autoIngest, executeIngestWrites, hasMineruImageRefs } from "./ingest"
 import { streamChat } from "./llm-client"
-import { parseWithMineru } from "./mineru"
+import { parseWithMineruResult } from "./mineru"
 
 const mockStreamChat = vi.mocked(streamChat)
-const mockParseWithMineru = vi.mocked(parseWithMineru)
+const mockParseWithMineru = vi.mocked(parseWithMineruResult)
 
 describe("autoIngest source summary paths", () => {
   let tmp: { path: string; cleanup: () => Promise<void> } | undefined
@@ -135,7 +136,7 @@ describe("autoIngest source summary paths", () => {
     await writeFileRaw(`${tmp.path}/purpose.md`, "# Purpose\n\nTrack project config files.\n")
     await writeFileRaw(
       `${tmp.path}/schema.md`,
-      "# Schema\n\nEach source needs its own source summary page.\n",
+      "# Schema\n\nEach source needs its own source summary page.\n\n## Page Types\n| goal | wiki/goals/ | Outcomes |\n| habit | wiki/habits/ | Behaviours |",
     )
     await writeFileRaw(`${tmp.path}/wiki/index.md`, "# Index\n")
     await writeFileRaw(`${tmp.path}/wiki/overview.md`, "# Overview\n")
@@ -335,6 +336,10 @@ describe("autoIngest source summary paths", () => {
       String(messages?.[0]?.content ?? "").startsWith("You are analyzing a long source document"),
     )
     expect(chunkCalls.length).toBeGreaterThan(1)
+    const chunkSystemPrompt = String(chunkCalls[0][1]?.[0]?.content ?? "")
+    expect(chunkSystemPrompt).toContain("wiki/goals/")
+    expect(chunkSystemPrompt).toContain("Schema-Typed Candidates")
+    expect(chunkSystemPrompt).toContain("never invent goals")
     expect(String(chunkCalls[0][1]?.[1]?.content ?? "")).toContain("## MAIN CHUNK TO ANALYZE")
     expect(String(chunkCalls[1][1]?.[1]?.content ?? "")).toContain(
       "Digest after chunk 1: stable context 1.",
@@ -502,7 +507,7 @@ describe("autoIngest source summary paths", () => {
         controller.signal,
         "project-a",
       ),
-    ).rejects.toThrow("AbortError")
+    ).rejects.toThrow("Ingest cancelled")
   })
 
   it("falls back to built-in PDF extraction when MinerU fails for a non-cancelled ingest", async () => {
@@ -559,7 +564,7 @@ describe("autoIngest source summary paths", () => {
         controller.signal,
         "project-a",
       ),
-    ).rejects.toThrow("MinerU parsing cancelled")
+    ).rejects.toThrow("Ingest cancelled")
 
     expect(
       useActivityStore.getState().items.some((item) =>

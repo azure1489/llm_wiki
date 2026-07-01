@@ -1,7 +1,11 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread;
+use tauri::AppHandle;
 use tiny_http::{Header, Method, Response, Server};
+
+use crate::cors::{local_cors_headers, request_origin};
+use crate::server_bind;
 
 static CURRENT_PROJECT: Mutex<String> = Mutex::new(String::new());
 static ALL_PROJECTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new()); // (name, path)
@@ -11,21 +15,23 @@ static PENDING_CLIPS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new()); // 
 static DAEMON_STATUS: AtomicU8 = AtomicU8::new(0);
 
 const DEFAULT_PORT: u16 = 19827;
-const DEFAULT_HOST: &str = "127.0.0.1";
 const MAX_BIND_RETRIES: u32 = 3;
 const MAX_RESTART_RETRIES: u32 = 10;
 const BIND_RETRY_DELAY_SECS: u64 = 2;
 const RESTART_DELAY_SECS: u64 = 5;
 
-/// Bind host for the clip server. Defaults to loopback. The clip endpoint is
-/// unauthenticated (it writes files into project dirs), so it should stay on
-/// 127.0.0.1 — `LLM_WIKI_CLIP_HOST` exists only for parity, not public exposure.
-fn bind_host() -> String {
+/// Bind host for the clip server. Resolution order: `LLM_WIKI_CLIP_HOST` env
+/// (kept for pinned multi-instance deployments) → the shared `server_bind`
+/// resolution (`LLM_WIKI_BIND_HOST` env, then the "Allow LAN access" app
+/// setting) → loopback. The clip endpoint is unauthenticated (it writes
+/// files into project dirs) — only enable LAN/0.0.0.0 exposure on trusted
+/// networks.
+fn bind_host(app: &AppHandle) -> String {
     std::env::var("LLM_WIKI_CLIP_HOST")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_HOST.to_string())
+        .unwrap_or_else(|| server_bind::configured_bind_host(app))
 }
 
 /// Listen port for the clip server. Defaults to 19827; override with
@@ -61,18 +67,19 @@ pub fn all_projects() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-pub fn start_clip_server() {
-    thread::spawn(|| {
+pub fn start_clip_server(app: AppHandle) {
+    thread::spawn(move || {
         let mut restart_count: u32 = 0;
 
         loop {
             // Try to bind the port with retries
-            let addr = format!("{}:{}", bind_host(), bind_port());
-            let server = {
+            let (server, addr) = {
+                let host = bind_host(&app);
+                let addr = server_bind::bind_addr(&host, bind_port());
                 let mut last_err = String::new();
                 let mut bound = None;
                 for attempt in 1..=MAX_BIND_RETRIES {
-                    match Server::http(addr.as_str()) {
+                    match Server::http(&addr) {
                         Ok(s) => {
                             bound = Some(s);
                             break;
@@ -80,8 +87,8 @@ pub fn start_clip_server() {
                         Err(e) => {
                             last_err = format!("{}", e);
                             eprintln!(
-                                "[Clip Server] Bind attempt {}/{} failed: {}",
-                                attempt, MAX_BIND_RETRIES, e
+                                "[Clip Server] Bind attempt {}/{} failed for {}: {}",
+                                attempt, MAX_BIND_RETRIES, addr, e
                             );
                             if attempt < MAX_BIND_RETRIES {
                                 thread::sleep(std::time::Duration::from_secs(
@@ -92,10 +99,10 @@ pub fn start_clip_server() {
                     }
                 }
                 match bound {
-                    Some(s) => s,
+                    Some(s) => (s, addr),
                     None => {
                         eprintln!(
-                            "[Clip Server] {} unavailable after {} attempts: {}",
+                            "[Clip Server] Address {} unavailable after {} attempts: {}",
                             addr, MAX_BIND_RETRIES, last_err
                         );
                         DAEMON_STATUS.store(2, Ordering::Relaxed); // port_conflict
@@ -109,13 +116,8 @@ pub fn start_clip_server() {
             println!("[Clip Server] Listening on http://{}", addr);
 
             for mut request in server.incoming_requests() {
-                let cors_headers = vec![
-                    Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap(),
-                    Header::from_bytes("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                        .unwrap(),
-                    Header::from_bytes("Access-Control-Allow-Headers", "Content-Type").unwrap(),
-                    Header::from_bytes("Content-Type", "application/json").unwrap(),
-                ];
+                let origin = request_origin(&request);
+                let cors_headers = cors_headers(origin.as_deref());
 
                 // Handle CORS preflight
                 if request.method() == &Method::Options {
@@ -123,6 +125,8 @@ pub fn start_clip_server() {
                     for h in &cors_headers {
                         response.add_header(h.clone());
                     }
+                    response
+                        .add_header(Header::from_bytes("Access-Control-Max-Age", "600").unwrap());
                     let _ = request.respond(response);
                     continue;
                 }
@@ -312,6 +316,10 @@ pub fn start_clip_server() {
             thread::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS));
         }
     });
+}
+
+fn cors_headers(origin: Option<&str>) -> Vec<Header> {
+    local_cors_headers(origin, "Content-Type")
 }
 
 fn handle_set_project(body: &str) -> String {

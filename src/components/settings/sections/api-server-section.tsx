@@ -32,6 +32,7 @@ interface ApiHealth {
   authRequired?: boolean
   authConfigured?: boolean
   allowUnauthenticated?: boolean
+  allowLanAccess?: boolean
   tokenSource?: "env" | "store" | "none"
 }
 
@@ -41,12 +42,14 @@ interface ApiHealth {
  * a route there, update this list — it's the only place users discover
  * the API contract until we ship a proper OpenAPI doc.
  */
-export const API_ENDPOINTS: Array<{ method: "GET" | "POST"; path: string; noteKey: string }> = [
+export const API_ENDPOINTS: Array<{ method: "GET" | "POST" | "PATCH"; path: string; noteKey: string }> = [
   { method: "GET", path: "/api/v1/health", noteKey: "endpointHealthNote" },
   { method: "GET", path: "/api/v1/projects", noteKey: "endpointProjectsNote" },
   { method: "GET", path: "/api/v1/projects/{id}/files", noteKey: "endpointFilesNote" },
   { method: "GET", path: "/api/v1/projects/{id}/files/content", noteKey: "endpointContentNote" },
   { method: "GET", path: "/api/v1/projects/{id}/reviews", noteKey: "endpointReviewsNote" },
+  { method: "PATCH", path: "/api/v1/projects/{id}/reviews/{reviewId}", noteKey: "endpointPatchReviewNote" },
+  { method: "POST", path: "/api/v1/projects/{id}/reviews/resolve", noteKey: "endpointBulkResolveNote" },
   { method: "POST", path: "/api/v1/projects/{id}/search", noteKey: "endpointSearchNote" },
   { method: "GET", path: "/api/v1/projects/{id}/graph", noteKey: "endpointGraphNote" },
   { method: "POST", path: "/api/v1/projects/{id}/sources/rescan", noteKey: "endpointRescanNote" },
@@ -146,6 +149,7 @@ export function ApiServerSection({ draft, setDraft }: Props) {
   const hasUnsavedApiConfig =
     persistedApiConfig.enabled !== draft.apiEnabled ||
     persistedApiConfig.allowUnauthenticated !== draft.apiAllowUnauthenticated ||
+    persistedApiConfig.allowLanAccess !== draft.apiAllowLanAccess ||
     persistedApiConfig.mcpEnabled !== draft.apiMcpEnabled ||
     persistedApiConfig.token !== draft.apiToken.trim()
 
@@ -281,6 +285,28 @@ export function ApiServerSection({ draft, setDraft }: Props) {
               {t("settings.sections.apiServer.allowUnauthenticatedHint", {
                 defaultValue:
                   "Use only for trusted local agents. Any process or browser page on this machine can call the API while this is enabled.",
+              })}
+            </p>
+          </div>
+        </label>
+
+        <label className="flex items-start gap-3 rounded-md border border-border/60 bg-background/40 px-3 py-2">
+          <input
+            type="checkbox"
+            checked={draft.apiAllowLanAccess}
+            onChange={(event) => setDraft("apiAllowLanAccess", event.target.checked)}
+            className="mt-1 h-4 w-4"
+          />
+          <div className="space-y-1">
+            <div className="text-sm font-semibold">
+              {t("settings.sections.apiServer.allowLanAccess", {
+                defaultValue: "Allow API and Clip server access from the local network",
+              })}
+            </div>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              {t("settings.sections.apiServer.allowLanAccessHint", {
+                defaultValue:
+                  "After restarting the app, the API and Clip server listen on 0.0.0.0 instead of 127.0.0.1. Use only on trusted networks, and keep token auth enabled unless you fully trust the LAN.",
               })}
             </p>
           </div>
@@ -488,7 +514,9 @@ export function ApiServerSection({ draft, setDraft }: Props) {
             const methodClass =
               endpoint.method === "GET"
                 ? "bg-blue-500/10 text-blue-700 dark:text-blue-400"
-                : "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                : endpoint.method === "PATCH"
+                  ? "bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                  : "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
             return (
               <div
                 key={`${endpoint.method} ${endpoint.path}`}

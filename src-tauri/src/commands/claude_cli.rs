@@ -30,6 +30,8 @@ use tokio::sync::Mutex;
 
 use super::cli_resolver::find_cli_command;
 
+const ISOLATED_MCP_CONFIG: &str = "{\"mcpServers\":{}}";
+
 /// Shared state holding running `claude` child processes keyed by the
 /// frontend-generated stream id. Registered via .manage() in lib.rs.
 #[derive(Default)]
@@ -404,7 +406,9 @@ fn build_claude_cli_args(model: &str, isolate_local_config: bool) -> Vec<String>
             "project".to_string(),
             "--strict-mcp-config".to_string(),
             "--mcp-config".to_string(),
-            "{}".to_string(),
+            // Claude's strict MCP config expects the top-level mcpServers key
+            // even when the isolated server set is intentionally empty.
+            ISOLATED_MCP_CONFIG.to_string(),
             "--disable-slash-commands".to_string(),
             "--tools".to_string(),
             "".to_string(),
@@ -424,17 +428,23 @@ async fn resolve_claude_working_directory(value: Option<String>) -> Result<PathB
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "Claude Code CLI requires an active project working directory".to_string())?;
+        .ok_or_else(|| {
+            "Claude Code CLI requires an active project working directory".to_string()
+        })?;
     let path = Path::new(raw.as_str());
     if !path.is_absolute() {
-        return Err("Claude Code CLI working directory must be an absolute project path".to_string());
+        return Err(
+            "Claude Code CLI working directory must be an absolute project path".to_string(),
+        );
     }
     let path_meta = tokio::fs::metadata(path).await.map_err(|e| {
         eprintln!("[claude-cli] failed to read working directory metadata {raw}: {e}");
         format!("Claude Code CLI working directory does not exist or cannot be read: {raw}")
     })?;
     if !path_meta.is_dir() {
-        return Err(format!("Claude Code CLI working directory is not a directory: {raw}"));
+        return Err(format!(
+            "Claude Code CLI working directory is not a directory: {raw}"
+        ));
     }
     let index_path = path.join("wiki").join("index.md");
     let index_meta = tokio::fs::metadata(&index_path).await.map_err(|e| {
@@ -517,11 +527,20 @@ mod tests {
         assert!(args.contains(&"sonnet".to_string()));
         assert!(!args.contains(&"--setting-sources".to_string()));
         assert!(!args.contains(&"--strict-mcp-config".to_string()));
+        assert!(!args.contains(&"--mcp-config".to_string()));
         assert!(!args.contains(&"--disable-slash-commands".to_string()));
     }
 
     #[test]
     fn claude_args_can_isolate_user_config_tools_and_mcp() {
+        assert_eq!(ISOLATED_MCP_CONFIG, "{\"mcpServers\":{}}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(ISOLATED_MCP_CONFIG).expect("isolated MCP config is valid JSON");
+        assert!(parsed
+            .get("mcpServers")
+            .and_then(|value| value.as_object())
+            .is_some_and(|servers| servers.is_empty()));
+
         let args = build_claude_cli_args("sonnet", true);
 
         assert!(args
@@ -530,7 +549,7 @@ mod tests {
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(args
             .windows(2)
-            .any(|pair| pair[0] == "--mcp-config" && pair[1] == "{}"));
+            .any(|pair| pair[0] == "--mcp-config" && pair[1] == ISOLATED_MCP_CONFIG));
         assert!(args.contains(&"--disable-slash-commands".to_string()));
         assert!(args
             .windows(2)
@@ -555,10 +574,12 @@ mod tests {
             .await
             .unwrap_err()
             .contains("active project"));
-        assert!(resolve_claude_working_directory(Some("relative/path".to_string()))
-            .await
-            .unwrap_err()
-            .contains("absolute"));
+        assert!(
+            resolve_claude_working_directory(Some("relative/path".to_string()))
+                .await
+                .unwrap_err()
+                .contains("absolute")
+        );
 
         let dir = std::env::temp_dir().join(format!(
             "llm-wiki-claude-cwd-{}-{}",
