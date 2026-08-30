@@ -19,6 +19,7 @@ import { useReviewStore, type ReviewItem } from "@/stores/review-store"
 import { getFileName, normalizePath } from "@/lib/path-utils"
 import {
   sourceIdentityForPath,
+  sourceReferenceIdentity,
   sourceSummarySlugCandidatesFromIdentity,
   sourceSummarySlugFromIdentity,
 } from "@/lib/source-identity"
@@ -41,6 +42,7 @@ import type { MultimodalConfig } from "@/stores/wiki-store"
 import { GENERATION_WIKI_TYPES } from "@/lib/wiki-page-types"
 import { computeContextBudget } from "@/lib/context-budget"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
+import { persistParsedMarkdown } from "@/lib/parsed-source-output"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
@@ -315,6 +317,9 @@ function resolveCaptionConfig(
     azureApiVersion: mm.azureApiVersion,
     azureModelFamily: mm.azureModelFamily,
     apiMode: mm.apiMode,
+    // The dedicated caption provider has no separate reasoning control. Reuse
+    // the ingest preference and let its own provider capabilities normalize it.
+    ingestReasoning: mainLlm.ingestReasoning,
     // The caption helper hits `streamChat` directly, which doesn't
     // care about `maxContextSize` (that field is for the analysis
     // / generation prompt-truncation logic). Keep it set so the
@@ -322,13 +327,14 @@ function resolveCaptionConfig(
     maxContextSize: mainLlm.maxContextSize,
   }
 }
-import { buildLanguageDirective } from "@/lib/output-language"
+import { buildLanguageDirective, getOutputLanguage } from "@/lib/output-language"
 import { detectLanguage } from "@/lib/detect-language"
-import { sameScriptFamily } from "@/lib/language-metadata"
+import { getLanguagePromptName, sameScriptFamily } from "@/lib/language-metadata"
 import {
   loadProjectWikiSchemaRouting,
   validateWikiPageRouting,
 } from "@/lib/wiki-schema"
+import { resolveIngestReasoning } from "@/lib/reasoning-capabilities"
 
 // Legacy export kept for backward compatibility with existing diagnostic
 // tests. The live pipeline goes through parseFileBlocks() below, which
@@ -349,6 +355,7 @@ export interface ParseFileBlocksResult {
    *  one is also console.warn'd. UI can surface these so users see that
    *  something was skipped instead of silently getting fewer pages. */
   warnings: string[]
+  truncatedPaths: string[]
 }
 
 // Line-level openers / closers. Both are case-insensitive, tolerant of
@@ -459,6 +466,7 @@ export function parseFileBlocks(text: string): ParseFileBlocksResult {
 
   const blocks: ParsedFileBlock[] = []
   const warnings: string[] = []
+  const truncatedPaths: string[] = []
 
   let i = 0
   while (i < lines.length) {
@@ -519,6 +527,7 @@ export function parseFileBlocks(text: string): ParseFileBlocksResult {
       const msg = `FILE block "${pathLabel}" was not closed before end of stream — likely truncation (model hit max_tokens, timeout, or connection dropped). Block dropped.`
       console.warn(`[ingest] ${msg}`)
       warnings.push(msg)
+      if (isSafeIngestPath(path)) truncatedPaths.push(path)
       continue
     }
 
@@ -542,7 +551,7 @@ export function parseFileBlocks(text: string): ParseFileBlocksResult {
     blocks.push({ path, content: contentLines.join("\n") })
   }
 
-  return { blocks, warnings }
+  return { blocks, warnings, truncatedPaths }
 }
 
 /**
@@ -557,14 +566,20 @@ export function languageRule(sourceContent: string = ""): string {
  * Auto-ingest: reads source → LLM analyzes → LLM writes wiki pages, all in one go.
  * Used when importing new files.
  *
- * Concurrency: this function holds a per-project lock for its full
- * duration. Two simultaneous calls for the same project (e.g. queue
- * + Save-to-Wiki) take turns. The lock is necessary because the
- * analysis stage reads `wiki/index.md` and the generation stage
- * overwrites it; without serialization, each call would emit an
- * "updated" index based on the same pre-state and overwrite each
- * other's additions.
+ * Concurrency: source preparation and LLM generation for different sources may
+ * overlap. Wiki-page and aggregate-file mutations run through a per-project
+ * commit boundary. Queue callers can add stricter ordering around that boundary.
  */
+export type IngestCommitRunner = <T>(operation: () => Promise<T>) => Promise<T>
+
+export interface AutoIngestOptions {
+  /**
+   * Adds queue ordering around a commit. The supplied runner must not acquire
+   * the project mutex; autoIngest always acquires it inside this callback.
+   */
+  runCommit?: IngestCommitRunner
+}
+
 export async function autoIngest(
   projectPath: string,
   sourcePath: string,
@@ -572,9 +587,21 @@ export async function autoIngest(
   signal?: AbortSignal,
   folderContext?: string,
   onFileWritten?: (relativePath: string) => void,
+  options?: AutoIngestOptions,
 ): Promise<string[]> {
-  return withProjectLock(normalizePath(projectPath), () =>
-    autoIngestImpl(projectPath, sourcePath, llmConfig, signal, folderContext, onFileWritten),
+  const pp = normalizePath(projectPath)
+  const sp = normalizePath(sourcePath)
+  return withProjectLock(
+    `ingest-source\0${pp}\0${sp}`,
+    () => autoIngestImpl(
+      projectPath,
+      sourcePath,
+      llmConfig,
+      signal,
+      folderContext,
+      onFileWritten,
+      options,
+    ),
   )
 }
 
@@ -600,6 +627,17 @@ export function formatIngestWarningLogEntry(
     ...warnings.map((warning, index) => `${index + 1}. ${warning}`),
     "",
   ].join("\n")
+}
+
+export function buildDeterministicIngestLog(
+  existing: string,
+  sourceIdentity: string,
+  date = currentWikiDate(),
+): string {
+  const entry = `## [${date}] ingest | ${sourceIdentity}`
+  return existing.trim()
+    ? `${existing.trimEnd()}\n\n${entry}\n`
+    : `# Wiki Log\n\n${entry}\n`
 }
 
 async function appendIngestWarningLog(
@@ -629,6 +667,7 @@ async function autoIngestImpl(
   signal?: AbortSignal,
   folderContext?: string,
   onFileWritten?: (relativePath: string) => void,
+  options?: AutoIngestOptions,
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
   const sp = normalizePath(sourcePath)
@@ -637,6 +676,10 @@ async function autoIngestImpl(
   const sourceIdentity = sourceIdentityForPath(pp, sp)
   const sourceSummarySlug = sourceSummarySlugFromIdentity(sourceIdentity)
   const sourceSummaryPath = `wiki/sources/${sourceSummarySlug}.md`
+  const queueCommit = options?.runCommit
+  const runCommit: IngestCommitRunner = queueCommit
+    ? ((operation) => queueCommit(() => withProjectLock(pp, operation)))
+    : ((operation) => withProjectLock(pp, operation))
   console.log(`[ingest:diag] autoIngestImpl ENTRY for "${fileName}" (project="${pp}", source="${sp}")`)
   const activityId = activity.addItem({
     type: "ingest",
@@ -652,7 +695,8 @@ async function autoIngestImpl(
   const mineruCfg = useWikiStore.getState().mineruConfig
   let mineruSucceeded = false
   let mineruSavedImages: SavedImage[] = []
-  if (isPdf && mineruCfg.enabled && mineruCfg.token) {
+  const mineruConfigured = mineruCfg.backend === "local" || Boolean(mineruCfg.token)
+  if (isPdf && mineruCfg.enabled && mineruConfigured) {
     try {
       const cacheDir = sp.substring(0, sp.lastIndexOf("/"))
       const cachePath = `${cacheDir}/.cache/${fileName}.txt`
@@ -695,6 +739,18 @@ async function autoIngestImpl(
     tryReadFile(`${pp}/wiki/index.md`),
     tryReadFile(`${pp}/wiki/overview.md`),
   ])
+  if (useWikiStore.getState().sourceWatchConfig.persistExtractedMarkdown) {
+    try {
+      await persistParsedMarkdown(pp, sp, sourceContent)
+    } catch (err) {
+      // The visible copy is optional and must never turn a successful parse
+      // into a failed ingest. The internal extraction/cache remains usable.
+      console.warn(
+        `[ingest] Failed to keep parsed Markdown for "${sourceIdentity}":`,
+        err instanceof Error ? err.message : err,
+      )
+    }
+  }
   if (isPdf && mineruSavedImages.length === 0 && hasMineruImageRefs(sourceContent, sourceSummarySlug)) {
     mineruSavedImages = await savedImagesFromMineruMarkdown(pp, sourceSummarySlug, sourceContent)
     if (mineruSavedImages.length > 0) {
@@ -716,7 +772,9 @@ async function autoIngestImpl(
   const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent)
   console.log(`[ingest:diag] cache check for "${sourceIdentity}":`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
   if (cachedFiles !== null) {
-    try {
+    return runCommit(async () => {
+      throwIfIngestAborted(signal, activityId)
+      try {
       console.log(`[ingest:diag] cache-hit branch: starting image extraction for ${sp}`)
       const skipNativePdfImageExtraction = isPdf && hasMineruImageRefs(sourceContent, sourceSummarySlug)
       let savedImages = skipNativePdfImageExtraction
@@ -751,17 +809,20 @@ async function autoIngestImpl(
           const captionLlm = resolveCaptionConfig(mmCfg, llmConfig)
           if (captionLlm) {
             try {
-              await captionMarkdownImages(pp, appendSavedImageRefsForCaption(sourceContent, savedImages), captionLlm, {
-                signal,
-                shouldCaption: (url) =>
-                  isSavedImagePromptUrl(pp, sourceSummarySlug, url),
-                urlToAbsPath: (url) => promptImageUrlToAbs(pp, url),
-                concurrency: mmCfg.concurrency,
-                onProgress: (done, total) =>
-                  activity.updateItem(activityId, {
-                    detail: `Captioning images... ${done}/${total}`,
-                  }),
-              })
+              await withProjectLock(`${pp}\0image-caption-cache`, () =>
+                captionMarkdownImages(pp, appendSavedImageRefsForCaption(sourceContent, savedImages), captionLlm, {
+                  signal,
+                  shouldCaption: (url) =>
+                    isSavedImagePromptUrl(pp, sourceSummarySlug, url),
+                  urlToAbsPath: (url) => promptImageUrlToAbs(pp, url),
+                  concurrency: mmCfg.concurrency,
+                  outputLanguage: getLanguagePromptName(getOutputLanguage(sourceContent)),
+                  onProgress: (done, total) =>
+                    activity.updateItem(activityId, {
+                      detail: `Captioning images... ${done}/${total}`,
+                    }),
+                }),
+              )
             } catch (err) {
               console.warn(
                 `[ingest:caption] cache-hit caption pass failed:`,
@@ -769,7 +830,13 @@ async function autoIngestImpl(
               )
             }
           }
-          await injectImagesIntoSourceSummary(pp, sourceIdentity, sourceSummarySlug, savedImages)
+          await injectImagesIntoSourceSummary(
+            pp,
+            sourceIdentity,
+            sourceSummarySlug,
+            savedImages,
+            getLanguagePromptName(getOutputLanguage(sourceContent)),
+          )
           // Re-embed the source-summary page so caption text lands
           // in the search index. Without this step, search by image
           // content stays empty for files ingested before captioning
@@ -781,18 +848,19 @@ async function autoIngestImpl(
       } else {
         console.log(`[ingest:diag] cache-hit branch: skipping injection (no images returned from extraction)`)
       }
-    } catch (err) {
-      console.warn(
-        `[ingest:images] cache-hit injection failed for "${fileName}":`,
-        err instanceof Error ? err.message : err,
-      )
-    }
-    activity.updateItem(activityId, {
-      status: "done",
-      detail: `Skipped (unchanged) — ${cachedFiles.length} files from previous ingest`,
-      filesWritten: cachedFiles,
+      } catch (err) {
+        console.warn(
+          `[ingest:images] cache-hit injection failed for "${fileName}":`,
+          err instanceof Error ? err.message : err,
+        )
+      }
+      activity.updateItem(activityId, {
+        status: "done",
+        detail: `Skipped (unchanged) — ${cachedFiles.length} files from previous ingest`,
+        filesWritten: cachedFiles,
+      })
+      return cachedFiles
     })
-    return cachedFiles
   }
 
   // ── Step 0.5: Extract embedded images ─────────────────────────
@@ -893,21 +961,24 @@ async function autoIngestImpl(
     activity.updateItem(activityId, { detail: "Captioning images..." })
     const ourMediaPrefix = `${pp}/wiki/media/${sourceSummarySlug}/`
     try {
-      const result = await captionMarkdownImages(pp, enrichedSourceContent, captionLlm, {
-        signal,
-        // Strict filter: only caption images we know we just
-        // extracted into this source's media directory. Skips any
-        // pre-existing markdown image refs the user may have typed
-        // into the source content (e.g. for hand-authored .md
-        // sources).
-        shouldCaption: (url) => url.startsWith(ourMediaPrefix) || isSavedImagePromptUrl(pp, sourceSummarySlug, url),
-        urlToAbsPath: (url) => promptImageUrlToAbs(pp, url),
-        concurrency: mmCfg.concurrency,
-        onProgress: (done, total) =>
-          activity.updateItem(activityId, {
-            detail: `Captioning images... ${done}/${total}`,
-          }),
-      })
+      const result = await withProjectLock(`${pp}\0image-caption-cache`, () =>
+        captionMarkdownImages(pp, enrichedSourceContent, captionLlm, {
+          signal,
+          // Strict filter: only caption images we know we just
+          // extracted into this source's media directory. Skips any
+          // pre-existing markdown image refs the user may have typed
+          // into the source content (e.g. for hand-authored .md
+          // sources).
+          shouldCaption: (url) => url.startsWith(ourMediaPrefix) || isSavedImagePromptUrl(pp, sourceSummarySlug, url),
+          urlToAbsPath: (url) => promptImageUrlToAbs(pp, url),
+          concurrency: mmCfg.concurrency,
+          outputLanguage: getLanguagePromptName(getOutputLanguage(enrichedSourceContent)),
+          onProgress: (done, total) =>
+            activity.updateItem(activityId, {
+              detail: `Captioning images... ${done}/${total}`,
+            }),
+        }),
+      )
       enrichedSourceContent = stripWikiMediaAbsPaths(pp, result.enrichedMarkdown)
       console.log(
         `[ingest:caption] images=${savedImages.length} fresh=${result.freshCaptions} cached=${result.cachedCaptions} failed=${result.failed}`,
@@ -976,7 +1047,7 @@ async function autoIngestImpl(
         },
       },
       signal,
-      { temperature: 0.1, reasoning: { mode: "off" }, max_tokens: 4096 },
+      { temperature: 0.1, reasoning: resolveIngestReasoning(llmConfig), max_tokens: 4096 },
     )
   }
 
@@ -1033,7 +1104,7 @@ async function autoIngestImpl(
     signal,
     {
       temperature: 0.1,
-      reasoning: { mode: "off" },
+      reasoning: resolveIngestReasoning(llmConfig),
       max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
     },
   )
@@ -1079,7 +1150,7 @@ async function autoIngestImpl(
         signal,
         {
           temperature: 0.1,
-          reasoning: { mode: "off" },
+          reasoning: resolveIngestReasoning(llmConfig),
           max_tokens: computeIngestReviewMaxTokens(llmConfig.maxContextSize),
         },
       )
@@ -1092,6 +1163,7 @@ async function autoIngestImpl(
   }
 
   // ── Step 3: Write files ───────────────────────────────────────
+  return runCommit(async () => {
   throwIfIngestAborted(signal, activityId)
   activity.updateItem(activityId, { detail: "Writing files..." })
   await migrateLegacySourceSummaryIfSafe(pp, sourceIdentity, sourceSummaryPath)
@@ -1109,66 +1181,65 @@ async function autoIngestImpl(
   const writtenPaths = writeResult.writtenPaths
   const writeWarnings = writeResult.warnings
   const hardFailures = writeResult.hardFailures
+  let unrecoveredTruncatedPaths = uniqueNormalizedPaths(
+    writeResult.truncatedPaths.filter((path) =>
+      !writtenPaths.some((writtenPath) => normalizePath(writtenPath) === normalizePath(path))
+    ),
+  )
 
-  const aggregateRepairPaths = aggregatePathsNeedingRepair(writtenPaths, writeWarnings)
-  const repairableAggregatePaths = aggregateRepairPaths.filter((path) =>
-    isAggregateRepairSafe(path, index, overview, llmConfig.maxContextSize),
-  )
-  const skippedAggregatePaths = aggregateRepairPaths.filter((path) =>
-    !repairableAggregatePaths.includes(path),
-  )
-  if (skippedAggregatePaths.length > 0) {
-    writeWarnings.push(
-      `Skipped aggregate repair for ${skippedAggregatePaths.join(", ")} because the existing file is too large to safely regenerate without truncating existing entries.`,
-    )
-  }
-  if (repairableAggregatePaths.length > 0 && !signal?.aborted) {
+  if (unrecoveredTruncatedPaths.length > 0 && !signal?.aborted) {
     activity.updateItem(activityId, {
-      detail: `Repairing aggregate wiki files: ${repairableAggregatePaths.join(", ")}`,
+      detail: `Retrying truncated wiki files: ${unrecoveredTruncatedPaths.join(", ")}`,
     })
-    let aggregateRepairOutput = ""
+    let repairOutput = ""
+    let repairFailed = false
     try {
       await streamChat(
         llmConfig,
         [
           {
             role: "system",
-            content: buildAggregateRepairPrompt(
-              repairableAggregatePaths,
-              purpose,
-              index,
-              overview,
+            content: buildTruncatedFileRepairPrompt(
+              unrecoveredTruncatedPaths,
               sourceIdentity,
-              analysis,
-              sourceContext,
-              generation,
-              llmConfig.maxContextSize,
+              {
+                schema,
+                purpose,
+                analysis,
+                sourceContext,
+                maxContextSize: llmConfig.maxContextSize,
+              },
             ),
           },
           {
             role: "user",
-            content: "Emit the requested aggregate FILE blocks now. Start immediately with `---FILE:`.",
+            content: "Regenerate the requested FILE blocks now. Start immediately with `---FILE:`.",
           },
         ],
         {
-          onToken: (token) => { aggregateRepairOutput += token },
+          onToken: (token) => { repairOutput += token },
           onDone: () => {},
           onError: (err) => {
-            writeWarnings.push(`Aggregate repair failed: ${err.message}`)
+            repairFailed = true
+            writeWarnings.push(`Truncated FILE repair failed: ${err.message}`)
           },
         },
         signal,
         {
           temperature: 0.1,
-          reasoning: { mode: "off" },
-          max_tokens: computeIngestReviewMaxTokens(llmConfig.maxContextSize),
+          reasoning: resolveIngestReasoning(llmConfig),
+          // A repair must regenerate the complete FILE body. Reusing the
+          // smaller review budget can immediately truncate the same long page
+          // that exhausted the original response.
+          max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
         },
       )
       throwIfIngestAborted(signal, activityId)
-      if (aggregateRepairOutput.trim()) {
-        const filteredRepair = filterAggregateRepairOutput(
-          aggregateRepairOutput,
-          repairableAggregatePaths,
+
+      if (!repairFailed && repairOutput.trim()) {
+        const filteredRepair = filterTruncatedFileRepairOutput(
+          repairOutput,
+          unrecoveredTruncatedPaths,
         )
         writeWarnings.push(...filteredRepair.warnings)
         const repairResult = await writeFileBlocks(
@@ -1181,14 +1252,66 @@ async function autoIngestImpl(
           activityId,
           onFileWritten,
         )
-        writtenPaths.push(...repairResult.writtenPaths)
+        // Match successful writes against the paths requested from the model,
+        // not the final on-disk paths. writeFileBlocks may legitimately rewrite
+        // a title-derived filename for the selected output language.
+        const completedInputPathKeys = new Set(
+          repairResult.completedInputPaths.map(normalizePath),
+        )
+        const recoveredPaths = filteredRepair.paths.filter((path) =>
+          completedInputPathKeys.has(normalizePath(path)),
+        )
+        for (const path of repairResult.writtenPaths) {
+          if (!writtenPaths.some((writtenPath) => normalizePath(writtenPath) === normalizePath(path))) {
+            writtenPaths.push(path)
+          }
+        }
+        for (const path of recoveredPaths) {
+          const warningPrefix = `FILE block "${path}" was not closed before end of stream`
+          for (let i = writeWarnings.length - 1; i >= 0; i--) {
+            if (writeWarnings[i].startsWith(warningPrefix)) writeWarnings.splice(i, 1)
+          }
+        }
         writeWarnings.push(...repairResult.warnings)
         hardFailures.push(...repairResult.hardFailures)
+        const recoveredPathKeys = new Set(recoveredPaths.map(normalizePath))
+        unrecoveredTruncatedPaths = unrecoveredTruncatedPaths.filter((path) =>
+          !recoveredPathKeys.has(normalizePath(path))
+        )
       }
     } catch (err) {
       throwIfIngestAborted(signal, activityId)
       writeWarnings.push(
-        `Aggregate repair failed: ${err instanceof Error ? err.message : String(err)}`,
+        `Truncated FILE repair failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
+
+  try {
+    if (await updateWikiIndexDeterministically(pp, writtenPaths)) {
+      writtenPaths.push("wiki/index.md")
+      onFileWritten?.("wiki/index.md")
+    }
+  } catch (err) {
+    writeWarnings.push(
+      `Deterministic index update failed: ${err instanceof Error ? err.message : String(err)}`,
+    )
+  }
+
+  // log.md is append-only structural metadata. If the model omitted its FILE
+  // block, write a deterministic entry instead of starting another LLM turn.
+  // This keeps multi-file imports at two generation stages per source and
+  // prevents a slow provider from making the queue appear stuck in "repair".
+  if (!writtenPaths.some((path) => normalizePath(path).toLowerCase() === "wiki/log.md") && !signal?.aborted) {
+    try {
+      const logPath = `${pp}/wiki/log.md`
+      const existingLog = await tryReadFile(logPath)
+      await writeFile(logPath, buildDeterministicIngestLog(existingLog, sourceIdentity))
+      writtenPaths.push("wiki/log.md")
+      onFileWritten?.("wiki/log.md")
+    } catch (err) {
+      writeWarnings.push(
+        `Deterministic log update failed: ${err instanceof Error ? err.message : String(err)}`,
       )
     }
   }
@@ -1218,22 +1341,7 @@ async function autoIngestImpl(
   // task for retry rather than "success".
   if (!hasSourceSummary && !signal?.aborted) {
     const date = new Date().toISOString().slice(0, 10)
-    const fallbackContent = [
-      "---",
-      `type: source`,
-      `title: "Source: ${sourceIdentity}"`,
-      `created: ${date}`,
-      `updated: ${date}`,
-      `sources: ["${sourceIdentity}"]`,
-      `tags: []`,
-      `related: []`,
-      "---",
-      "",
-      `# Source: ${sourceIdentity}`,
-      "",
-      analysis ? analysis.slice(0, 3000) : "(Analysis not available)",
-      "",
-    ].join("\n")
+    const fallbackContent = buildFallbackSourceSummary(sourceIdentity, analysis, date)
     try {
       await writeFile(sourceSummaryFullPath, fallbackContent)
       writtenPaths.push(sourceSummaryPath)
@@ -1249,7 +1357,13 @@ async function autoIngestImpl(
   // want the safety-net section to slip image refs into the wiki
   // through the back door.
   if (mmCfg.enabled && savedImages.length > 0 && !signal?.aborted) {
-    await injectImagesIntoSourceSummary(pp, sourceIdentity, sourceSummarySlug, savedImages)
+    await injectImagesIntoSourceSummary(
+      pp,
+      sourceIdentity,
+      sourceSummarySlug,
+      savedImages,
+      getLanguagePromptName(getOutputLanguage(sourceContent)),
+    )
   }
 
   if (writtenPaths.length > 0) {
@@ -1260,7 +1374,34 @@ async function autoIngestImpl(
     }
   }
 
+  // A partial write is not a successful ingest. Keep the generated files on
+  // disk so a retry can merge/repair them, but do not cache or embed the
+  // incomplete result. Throwing here keeps the queue task visible as
+  // pending/failed instead of removing it as "done" while Sources reports the
+  // same file as not ingested.
+  if (hardFailures.length > 0 || unrecoveredTruncatedPaths.length > 0) {
+    const reasons = [
+      hardFailures.length > 0
+        ? `${hardFailures.length} wiki file write failure(s)`
+        : "",
+      unrecoveredTruncatedPaths.length > 0
+        ? `${unrecoveredTruncatedPaths.length} truncated wiki file(s) could not be repaired: ${unrecoveredTruncatedPaths.join(", ")}`
+        : "",
+    ].filter(Boolean)
+    const message = `Ingest incomplete: ${reasons.join("; ")}`
+    activity.updateItem(activityId, {
+      status: "error",
+      detail: warningSummary
+        ? `${message} — ${warningSummary} (saved to .llm-wiki/ingest-warnings.log)`
+        : message,
+      filesWritten: writtenPaths,
+    })
+    throw new Error(message)
+  }
+
   // ── Step 4: Parse review items ────────────────────────────────
+  // Do this only after the completeness gate above. Otherwise every queue
+  // retry could duplicate review items derived from the same partial output.
   throwIfIngestAborted(signal, activityId)
   const reviewItems = [
     ...parseReviewBlocks(generation, sp),
@@ -1271,22 +1412,20 @@ async function autoIngestImpl(
   }
 
   // ── Step 5: Save to cache ───────────────────────────────────
-  // Skip cache when ANY block hit a hard FS failure: we'd otherwise
-  // freeze the partial-write result into the cache and a future
-  // re-ingest of the same source would silently replay only the
-  // pages that succeeded the first time, never giving the user a
-  // chance to recover the failed ones. Soft drops (language
-  // mismatch, path-traversal rejection, empty-path) are NOT failures
-  // — they represent deterministic decisions and caching them is
-  // safe.
-  if (writtenPaths.length > 0 && hardFailures.length === 0) {
+  // Skip cache when a write fails or a truncated path remains unrecovered;
+  // otherwise the partial result would be replayed without another LLM turn.
+  if (
+    writtenPaths.length > 0 &&
+    hardFailures.length === 0 &&
+    unrecoveredTruncatedPaths.length === 0
+  ) {
     await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths)
     if (longSourceCheckpointPath) {
       await clearLongSourceCheckpoint(longSourceCheckpointPath)
     }
-  } else if (hardFailures.length > 0) {
+  } else if (hardFailures.length > 0 || unrecoveredTruncatedPaths.length > 0) {
     console.warn(
-      `[ingest] Skipping cache save for "${sourceIdentity}" — ${hardFailures.length} block(s) failed to write: ${hardFailures.join(", ")}`,
+      `[ingest] Skipping cache save for "${sourceIdentity}" — ${hardFailures.length} write failure(s), ${unrecoveredTruncatedPaths.length} truncated FILE block(s) still missing.`,
     )
   }
 
@@ -1300,8 +1439,8 @@ async function autoIngestImpl(
         if (!pageId || ["index", "log", "overview"].includes(pageId)) continue
         try {
           const content = await readFile(`${pp}/${wpath}`)
-          const titleMatch = content.match(/^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m)
-          const title = titleMatch ? titleMatch[1].trim() : pageId
+          const fmTitle = parseFrontmatter(content).frontmatter?.title
+          const title = typeof fmTitle === "string" && fmTitle.trim() ? fmTitle.trim() : pageId
           await embedPage(pp, pageId, title, content, embCfg)
         } catch {
           // non-critical
@@ -1326,6 +1465,7 @@ async function autoIngestImpl(
   })
 
   return writtenPaths
+  })
 }
 
 /**
@@ -1375,6 +1515,11 @@ function isListingPath(relativePath: string): boolean {
   )
 }
 
+export function isAppManagedAggregatePath(relativePath: string): boolean {
+  const normalized = relativePath.replace(/\\/g, "/").toLowerCase()
+  return normalized === "wiki/index.md" || normalized === "wiki/overview.md"
+}
+
 const CJK_OUTPUT_LANGUAGES = new Set(["Chinese", "Traditional Chinese", "Japanese", "Korean"])
 
 function containsCjk(text: string): boolean {
@@ -1393,7 +1538,15 @@ export function rewriteIngestPathFromTitleForTargetLanguage(
   content: string,
   targetLang: string | undefined,
 ): string {
-  if (!targetLang || targetLang === "auto" || !CJK_OUTPUT_LANGUAGES.has(targetLang)) {
+  const title = extractGeneratedPageTitle(content)
+  // "auto" (the default output language) means "follow the source", so resolve
+  // it from the generated title. The title is the filename authority; using
+  // the whole body lets large SQL/code blocks or English technical prose
+  // outweigh a short CJK title and silently retain an ASCII filename.
+  const shouldUseCjkFilename = !targetLang || targetLang === "auto"
+    ? Boolean(title && containsCjk(title))
+    : CJK_OUTPUT_LANGUAGES.has(targetLang)
+  if (!shouldUseCjkFilename) {
     return relativePath
   }
   if (
@@ -1403,7 +1556,6 @@ export function rewriteIngestPathFromTitleForTargetLanguage(
   ) {
     return relativePath
   }
-  const title = extractGeneratedPageTitle(content)
   if (!title || !containsCjk(title)) return relativePath
 
   const slash = relativePath.lastIndexOf("/")
@@ -1417,64 +1569,89 @@ export function rewriteIngestPathFromTitleForTargetLanguage(
   return isSafeIngestPath(nextPath) ? nextPath : relativePath
 }
 
-export function aggregatePathsNeedingRepair(writtenPaths: string[], warnings: string[]): string[] {
-  const written = new Set(writtenPaths.map((path) => normalizePath(path)))
-  const warningText = warnings.join("\n")
-  return AGGREGATE_WIKI_PATHS.filter((path) =>
-    !written.has(path) || warningText.includes(`"${path}"`),
+async function updateWikiIndexDeterministically(
+  projectPath: string,
+  writtenPaths: string[],
+): Promise<boolean> {
+  const candidates = Array.from(new Set(writtenPaths.map(normalizePath))).filter((path) =>
+    path.startsWith("wiki/")
+      && path.endsWith(".md")
+      && !AGGREGATE_WIKI_PATHS.includes(path as (typeof AGGREGATE_WIKI_PATHS)[number]),
   )
-}
+  if (candidates.length === 0) return false
 
-export function filterAggregateRepairOutput(text: string, allowedPaths: string[]): {
-  text: string
-  warnings: string[]
-} {
-  const allowed = new Set(allowedPaths.map((path) => normalizePath(path)))
-  const { blocks, warnings } = parseFileBlocks(text)
-  const kept = blocks.filter((block) => allowed.has(normalizePath(block.path)))
-  const dropped = blocks.filter((block) => !allowed.has(normalizePath(block.path)))
-  if (dropped.length > 0) {
-    warnings.push(
-      `Dropped ${dropped.length} non-aggregate block(s) from aggregate repair output: ${dropped.map((block) => block.path).join(", ")}`,
-    )
+  const indexPath = `${projectPath}/wiki/index.md`
+  const index = await readFile(indexPath).catch(() => "# Wiki Index\n")
+  const knownTargets = new Set(
+    Array.from(index.matchAll(/\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]/g))
+      .map((match) => normalizeIndexTarget(match[1])),
+  )
+  const additions: string[] = []
+  for (const path of candidates) {
+    const target = path.replace(/^wiki\//, "").replace(/\.md$/i, "")
+    if (knownTargets.has(normalizeIndexTarget(target))) continue
+    const content = await readFile(`${projectPath}/${path}`).catch(() => "")
+    const parsed = parseFrontmatter(content)
+    const title = typeof parsed.frontmatter?.title === "string"
+      ? parsed.frontmatter.title.trim()
+      : getFileName(path).replace(/\.md$/i, "")
+    additions.push(`- [[${target}]] — ${title}`)
   }
-  return {
-    text: kept
-      .map((block) => `---FILE: ${block.path}---\n${block.content.trimEnd()}\n---END FILE---`)
-      .join("\n\n"),
-    warnings,
-  }
-}
+  if (additions.length === 0) return false
 
-function aggregateRepairSectionCap(maxContextSize: number | undefined): number {
-  const { maxCtx } = computeContextBudget(maxContextSize)
-  return Math.max(4_000, Math.floor(maxCtx * 0.12))
-}
-
-function isAggregateRepairSafe(
-  path: string,
-  index: string,
-  overview: string,
-  maxContextSize: number | undefined,
-): boolean {
-  const cap = aggregateRepairSectionCap(maxContextSize)
-  if (path === "wiki/index.md") return index.length <= cap
-  if (path === "wiki/overview.md") return overview.length <= cap
+  await writeFile(indexPath, updateBoundedRecentIndexSection(index, additions))
   return true
 }
 
-function canonicalizeSourcesField(content: string, sourceIdentity: string): string {
+function normalizeIndexTarget(target: string): string {
+  return normalizePath(target)
+    .replace(/^wiki\//i, "")
+    .replace(/\.md$/i, "")
+    .toLowerCase()
+}
+
+export function updateBoundedRecentIndexSection(index: string, additions: string[]): string {
+  const section = "## Recently Updated"
+  const lines = index.trimEnd().split("\n")
+  const start = lines.findIndex((line) => line.trim() === section)
+  const prefix = start >= 0 ? lines.slice(0, start) : lines
+  const sectionEnd = start >= 0
+    ? lines.findIndex((line, position) => position > start && /^##\s+/.test(line))
+    : -1
+  const existing = start >= 0
+    ? lines.slice(start + 1, sectionEnd >= 0 ? sectionEnd : undefined).filter((line) => /^-\s+/.test(line))
+    : []
+  const suffix = sectionEnd >= 0 ? lines.slice(sectionEnd) : []
+  const recent = Array.from(new Set([...additions, ...existing])).slice(0, 200)
+  return [...prefix, "", section, ...recent, ...(suffix.length ? ["", ...suffix] : []), ""].join("\n")
+}
+
+function isValidSourceReference(source: string, activeSourceIdentity: string): boolean {
+  const normalized = normalizePath(source).replace(/^(?:\.\/)+/, "")
+  const key = normalized.toLowerCase()
+  const identityKey = normalizePath(activeSourceIdentity).toLowerCase()
+  if (!normalized || normalized.startsWith("/") || /^[a-z]:\//i.test(normalized)) return false
+  if (normalized.split("/").some((part) => part === "..")) return false
+  if (sourceReferenceIdentity(normalized).toLowerCase() === identityKey) return true
+  if (["wiki/index.md", "wiki/overview.md", "wiki/log.md"].includes(key)) return false
+  if (key === ".llm-wiki" || key.startsWith(".llm-wiki/")) return false
+  return true
+}
+
+export function canonicalizeSourcesField(content: string, sourceIdentity: string): string {
   if (!/^---\n/.test(content)) return content
 
   const identityKey = normalizePath(sourceIdentity).toLowerCase()
   const identityBaseName = getFileName(sourceIdentity).toLowerCase()
   const sourceValues = parseSources(content)
-  const canonicalValues = sourceValues.map((source) => {
-    const normalized = normalizePath(source)
+  const canonicalValues = sourceValues.filter((source) =>
+    isValidSourceReference(source, sourceIdentity)
+  ).map((source) => {
+    const normalized = sourceReferenceIdentity(source)
     const key = normalized.toLowerCase()
     if (key === identityKey) return sourceIdentity
     if (!normalized.includes("/") && key === identityBaseName) return sourceIdentity
-    return source
+    return normalized
   })
   if (!canonicalValues.some((source) => normalizePath(source).toLowerCase() === identityKey)) {
     canonicalValues.push(sourceIdentity)
@@ -1649,6 +1826,32 @@ export function currentWikiDate(now: Date = new Date()): string {
   return `${year}-${month}-${day}`
 }
 
+export function buildFallbackSourceSummary(
+  sourceIdentity: string,
+  analysis: string,
+  date: string,
+): string {
+  return [
+    "---",
+    "type: source",
+    `title: "Source: ${sourceIdentity}"`,
+    `created: ${date}`,
+    `updated: ${date}`,
+    `sources: ["${sourceIdentity}"]`,
+    "tags: []",
+    "related: []",
+    "---",
+    "",
+    `# Source: ${sourceIdentity}`,
+    "",
+    // This is a recovery page, so preserving the complete analysis matters
+    // more than keeping the page short. Truncating here used to create
+    // syntactically valid but silently incomplete source summaries.
+    analysis || "(Analysis not available)",
+    "",
+  ].join("\n")
+}
+
 export function stampGeneratedFrontmatterDates(content: string, date: string): string {
   const fmRe = /^(---\s*\r?\n)([\s\S]*?)(\r?\n---\s*(?:\r?\n|$))/
   const match = content.match(fmRe)
@@ -1688,10 +1891,20 @@ async function writeFileBlocks(
   signal?: AbortSignal,
   activityId?: string,
   onFileWritten?: (relativePath: string) => void,
-): Promise<{ writtenPaths: string[]; warnings: string[]; hardFailures: string[] }> {
-  const { blocks, warnings: parseWarnings } = parseFileBlocks(text)
+): Promise<{
+  writtenPaths: string[]
+  completedInputPaths: string[]
+  warnings: string[]
+  hardFailures: string[]
+  truncatedPaths: string[]
+}> {
+  const { blocks, warnings: parseWarnings, truncatedPaths } = parseFileBlocks(text)
   const warnings = [...parseWarnings]
   const writtenPaths: string[] = []
+  // Keep the model-requested path separate from the final path. Path
+  // canonicalization may rename the file after parsing, but callers that
+  // repair a specific FILE block still need to know that request succeeded.
+  const completedInputPaths: string[] = []
   // "Hard failures" = blocks we INTENDED to write but the FS rejected
   // (disk full, permission, OS-level errors). Distinct from soft drops
   // (language mismatch, parse warnings, path-traversal rejections):
@@ -1711,6 +1924,12 @@ async function writeFileBlocks(
     let relativePath = rawRelativePath
     if (sourceSummaryPath && relativePath.startsWith("wiki/sources/")) {
       relativePath = sourceSummaryPath
+    }
+    if (isAppManagedAggregatePath(relativePath)) {
+      warnings.push(
+        `Ignored model-generated "${relativePath}"; aggregate navigation is maintained by the application.`,
+      )
+      continue
     }
 
     // Sanitize at the boundary — strip stray code-fence wrappers,
@@ -1811,7 +2030,14 @@ async function writeFileBlocks(
         // body + array-field union" with a best-effort backup.
         // See page-merge.ts.
         const existing = await tryReadFile(fullPath)
-        const toWrite = await mergePageContent(
+        // Re-ingesting a corrected source must replace pages owned solely by
+        // that source. Merging the old body back into the new generation kept
+        // retracted wording alive indefinitely. Multi-source pages still use
+        // the merger because their other sources' contributions must survive.
+        const replaceExistingBody = Boolean(
+          existing && isOwnedOnlyBySource(existing, sourceFileName),
+        )
+        const merged = await mergePageContent(
           content,
           existing || null,
           buildPageMerger(llmConfig),
@@ -1820,11 +2046,16 @@ async function writeFileBlocks(
             pagePath: relativePath,
             signal,
             backup: (oldContent) => backupExistingPage(projectPath, relativePath, oldContent),
+            replaceExistingBody,
           },
         )
+        // The merge unions existing frontmatter arrays, so sanitize again to
+        // remove legacy/generated paths that may already be stored on disk.
+        const toWrite = canonicalizeSourcesField(merged, sourceFileName)
         await writeFile(fullPath, toWrite)
       }
       writtenPaths.push(relativePath)
+      completedInputPaths.push(rawRelativePath)
       onFileWritten?.(relativePath)
     } catch (err) {
       const msg = `Failed to write "${relativePath}": ${err instanceof Error ? err.message : String(err)}`
@@ -1834,7 +2065,22 @@ async function writeFileBlocks(
     }
   }
 
-  return { writtenPaths, warnings, hardFailures }
+  return {
+    writtenPaths,
+    completedInputPaths,
+    warnings,
+    hardFailures,
+    truncatedPaths,
+  }
+}
+
+function isOwnedOnlyBySource(content: string, sourceIdentity: string): boolean {
+  const sources = parseSources(content)
+  if (sources.length === 0) return false
+  const expected = sourceReferenceIdentity(sourceIdentity).toLowerCase()
+  return sources.every(
+    (source) => sourceReferenceIdentity(source).toLowerCase() === expected,
+  )
 }
 
 const REVIEW_BLOCK_REGEX = /---REVIEW:\s*(\w[\w-]*)\s*\|\s*(.+?)\s*---\n([\s\S]*?)---END REVIEW---/g
@@ -1947,6 +2193,7 @@ export function buildAnalysisPrompt(
     "- What evidence supports them?",
     "- How strong is the evidence?",
     "- Which named subject is each claim about? Do not transfer claims, limits, or evaluations from one entity/model/product/method to another just because they share keywords.",
+    "- Preserve structured source data verbatim in the analysis when present: include SQL DDL / CREATE TABLE statements, schema definitions, API signatures, configuration, and tables in fenced code blocks or Markdown tables. Do not reduce exact field names, types, constraints, keys, or indexes to prose.",
     "",
     "## Connections to Existing Wiki",
     "- What existing pages does this source relate to?",
@@ -2019,9 +2266,8 @@ export function buildGenerationPrompt(
     `1. A source summary page at **${summaryPath}** (MUST use this exact path)`,
     "2. Entity or schema-defined typed pages for key named things identified in the analysis. Prefer schema-defined directories when present; otherwise use wiki/entities/.",
     "3. Concept or schema-defined typed pages for key ideas, methods, techniques, and abstractions. Prefer schema-defined directories when present; otherwise use wiki/concepts/.",
-    "4. An updated wiki/index.md — add new entries to existing categories, preserve all existing entries",
-    "5. A log entry for wiki/log.md (just the new entry to append, format: ## [YYYY-MM-DD] ingest | Title)",
-    "6. An updated wiki/overview.md — a high-level summary of what the entire wiki covers, updated to reflect the newly ingested source. This should be a comprehensive 2-5 paragraph overview of ALL topics in the wiki, not just the new source.",
+    "4. A log entry for wiki/log.md (just the new entry to append, format: ## [YYYY-MM-DD] ingest | Title)",
+    "Do not generate wiki/index.md or wiki/overview.md. The application maintains aggregate navigation separately so large wikis are never rewritten through model output.",
     "",
     "## Frontmatter Rules (CRITICAL — parser is strict)",
     "",
@@ -2070,8 +2316,9 @@ export function buildGenerationPrompt(
     "- Preserve subject boundaries: when a source discusses multiple entities/models/products/methods, keep claims, evaluations, limitations, benchmark results, and recommendations attached to the exact subject they describe.",
     "- Do not merge or generalize a claim about one subject into another subject's page solely because they share terms (for example context window size, benchmark name, dataset, architecture, or feature name).",
     "- If a page needs to mention another subject for comparison, write it explicitly as a comparison and cite which source/frontmatter `sources` entry supports that statement.",
-    "- Use kebab-case filenames",
+    "- Use kebab-case for Latin-script filenames; for Chinese/Japanese/Korean titles keep the CJK characters (do NOT romanize to pinyin/romaji or translate to English)",
     "- Derive filenames from the page title in the mandatory output language, but short proper nouns and technical identifiers take precedence: preserve names such as OpenAI, GPT-5, Transformer, CLIP, ImageNet, PyTorch, CUDA, GitHub, arXiv, React, LanceDB, AnyTXT, MinerU, model names, dataset names, tool names, and code identifiers in their standard original form. Do not put raw URLs, citation strings, or full paper titles directly into file paths; convert surrounding descriptive prose to a safe readable title. For Chinese/Japanese/Korean prose titles, keep readable CJK characters in the filename instead of translating the slug to English.",
+    "- Preserve structured source data verbatim: copy SQL DDL / CREATE TABLE statements, schema definitions, API signatures, configuration, and tabular data into fenced code blocks (or Markdown tables) in the source summary page instead of paraphrasing them. Exact column names, types, constraints, primary/foreign keys, and indexes must survive ingest — a prose-only summary that drops them loses the structure the user imported the source to keep.",
     "- Follow the analysis recommendations on what to emphasize",
     "- If the analysis found connections to existing pages, add cross-references",
     "",
@@ -2206,60 +2453,91 @@ function buildReviewSuggestionPrompt(
   ].filter(Boolean).join("\n")
 }
 
-function buildAggregateRepairPrompt(
-  paths: string[],
-  purpose: string,
-  index: string,
-  overview: string,
+type TruncatedFileRepairContext = {
+  readonly schema: string
+  readonly purpose: string
+  readonly analysis: string
+  readonly sourceContext: string
+  readonly maxContextSize: number | undefined
+}
+
+function buildTruncatedFileRepairPrompt(
+  paths: readonly string[],
   sourceIdentity: string,
-  analysis: string,
-  sourceContext: string,
-  generation: string,
-  maxContextSize: number | undefined,
+  context: TruncatedFileRepairContext,
 ): string {
-  const sectionCap = aggregateRepairSectionCap(maxContextSize)
-  const today = currentWikiDate()
+  const { schema, purpose, analysis, sourceContext, maxContextSize } = context
+  const { maxCtx } = computeContextBudget(maxContextSize)
+  const sectionCap = Math.max(4_000, Math.floor(maxCtx * 0.12))
   return [
-    "You are repairing aggregate wiki files after an ingest generation.",
-    "Do not output chain-of-thought, hidden reasoning, or explanatory preamble.",
+    "You are repairing truncated wiki FILE blocks from an earlier generation.",
+    "Return exactly one complete FILE block for each requested path and no other files.",
+    "Every block must end with `---END FILE---`. Do not output a preamble, REVIEW blocks, or trailing commentary.",
+    "Preserve the requested paths exactly and include the source identity in each page's frontmatter `sources` field.",
     "",
     languageRule(sourceContext),
     "",
-    "Generate ONLY the requested aggregate FILE blocks listed below.",
-    "Do not generate entity, concept, source summary, query, comparison, or synthesis pages.",
-    "",
-    "Requested paths:",
+    "## Requested paths",
     ...paths.map((path) => `- ${path}`),
     "",
-    "Rules:",
-    `- Use today's date ${today} for log entries and frontmatter dates.`,
-    "- For wiki/index.md: output the complete updated index, preserving existing entries and adding the new source-derived entries.",
-    "- For wiki/overview.md: output the complete updated overview, reflecting the full wiki plus this new source.",
-    "- For wiki/log.md: output only the new log entry to append, format `## [YYYY-MM-DD] ingest | Title`.",
-    "- Output only FILE blocks. Nothing else.",
-    "",
-    "FILE block template:",
-    "```",
-    "---FILE: wiki/path.md---",
-    "(complete file content, or just the new log entry for wiki/log.md)",
-    "---END FILE---",
-    "```",
-    "",
-    purpose ? `## Wiki Purpose\n${trimLongText(purpose, Math.floor(sectionCap * 0.5))}` : "",
-    index ? `## Current Wiki Index\n${trimLongText(index, sectionCap)}` : "",
-    overview ? `## Current Overview\n${trimLongText(overview, sectionCap)}` : "",
-    "",
-    `## Source\n${sourceIdentity}`,
-    "",
-    "## Stage 1 Analysis",
-    trimLongText(analysis, sectionCap),
-    "",
-    "## Source Context",
-    trimLongText(sourceContext, sectionCap),
-    "",
-    "## First Generation Output",
-    trimLongText(generation, sectionCap),
+    `## Source identity\n${sourceIdentity}`,
+    schema ? `## Project schema\n${trimLongText(schema, sectionCap)}` : "",
+    purpose ? `## Wiki purpose\n${trimLongText(purpose, sectionCap)}` : "",
+    `## Stage 1 analysis\n${trimLongText(analysis, sectionCap)}`,
+    `## Source context\n${trimLongText(sourceContext, sectionCap)}`,
   ].filter(Boolean).join("\n")
+}
+
+export function filterTruncatedFileRepairOutput(
+  text: string,
+  allowedPaths: readonly string[],
+): { text: string; paths: string[]; warnings: string[] } {
+  const allowed = new Set(allowedPaths.map(normalizePath))
+  const { blocks, warnings } = parseFileBlocks(text)
+  const seen = new Set<string>()
+  const kept: ParsedFileBlock[] = []
+  const dropped: ParsedFileBlock[] = []
+  const duplicates: ParsedFileBlock[] = []
+  for (const block of blocks) {
+    const pathKey = normalizePath(block.path)
+    if (!allowed.has(pathKey)) {
+      dropped.push(block)
+      continue
+    }
+    if (seen.has(pathKey)) {
+      duplicates.push(block)
+      continue
+    }
+    seen.add(pathKey)
+    kept.push(block)
+  }
+  if (dropped.length > 0) {
+    warnings.push(
+      `Dropped ${dropped.length} unrequested FILE block(s) from truncated repair output: ${dropped.map((block) => block.path).join(", ")}`,
+    )
+  }
+  if (duplicates.length > 0) {
+    warnings.push(
+      `Dropped ${duplicates.length} duplicate FILE block(s) from truncated repair output: ${duplicates.map((block) => block.path).join(", ")}`,
+    )
+  }
+  return {
+    text: kept
+      .map((block) => `---FILE: ${block.path}---\n${block.content.trimEnd()}\n---END FILE---`)
+      .join("\n\n"),
+    paths: kept.map((block) => block.path),
+    warnings,
+  }
+}
+
+function uniqueNormalizedPaths(paths: readonly string[]): string[] {
+  const seen = new Set<string>()
+  return paths.filter((path) => {
+    const key = normalizePath(path)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 function getStore() {
@@ -2552,6 +2830,7 @@ function buildChunkAnalysisSystemPrompt(
     "- New or updated concepts",
     "- Any schema-defined page types beyond entity/concept that the main chunk genuinely supports",
     "- Claims, findings, evidence, contradictions",
+    "- Exact structured data from this chunk, when present: preserve SQL DDL / CREATE TABLE statements, schema definitions, API signatures, configuration, and tables verbatim in fenced code blocks or Markdown tables; retain field names, types, constraints, keys, and indexes",
     "- Open questions or research gaps",
     "",
     "## Updated Global Digest",
@@ -2667,7 +2946,7 @@ async function analyzeLongSourceInChunks(
         },
       },
       signal,
-      { temperature: 0.1, reasoning: { mode: "off" }, max_tokens: 4096 },
+      { temperature: 0.1, reasoning: resolveIngestReasoning(llmConfig), max_tokens: 4096 },
     )
 
     throwIfIngestAborted(signal, activityId)
@@ -2842,6 +3121,7 @@ async function injectImagesIntoSourceSummary(
   sourceIdentity: string,
   sourceSummarySlug: string,
   savedImages: { relPath: string; page: number | null; sha256?: string }[],
+  outputLanguage?: string,
 ): Promise<void> {
   if (savedImages.length === 0) return
   const sourceSummaryPath = `wiki/sources/${sourceSummarySlug}.md`
@@ -2855,7 +3135,7 @@ async function injectImagesIntoSourceSummary(
     // indexes whatever's in the wiki page, so without this, search
     // by image content (e.g. "find the chart with revenue data")
     // never matches because alt text was empty.
-    const captionsBySha = await loadCaptionCache(pp)
+    const captionsBySha = await loadCaptionCache(pp, outputLanguage)
     const newSection = buildImageMarkdownSection(
       savedImages.map((img) => ({
         ...img,
@@ -2932,10 +3212,8 @@ async function reembedSourceSummary(
   const sourceSummaryFullPath = `${pp}/wiki/sources/${sourceSummarySlug}.md`
   try {
     const content = await readFile(sourceSummaryFullPath)
-    const titleMatch = content.match(
-      /^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m,
-    )
-    const title = titleMatch ? titleMatch[1].trim() : sourceIdentity
+    const fmTitle = parseFrontmatter(content).frontmatter?.title
+    const title = typeof fmTitle === "string" && fmTitle.trim() ? fmTitle.trim() : sourceIdentity
     const { embedPage } = await import("@/lib/embedding")
     await embedPage(pp, sourceSummarySlug, title, content, embCfg)
     console.log(`[ingest:caption] re-embedded ${sourceSummarySlug} with captioned alt text`)
@@ -3037,7 +3315,19 @@ export async function startIngest(
   )
 }
 
-export async function executeIngestWrites(
+export function executeIngestWrites(
+  projectPath: string,
+  llmConfig: LlmConfig,
+  userGuidance?: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const pp = normalizePath(projectPath)
+  return withProjectLock(pp, () =>
+    executeIngestWritesImpl(pp, llmConfig, userGuidance, signal)
+  )
+}
+
+async function executeIngestWritesImpl(
   projectPath: string,
   llmConfig: LlmConfig,
   userGuidance?: string,
@@ -3089,6 +3379,7 @@ export async function executeIngestWrites(
     "```",
     "",
     "For wiki/log.md, include a log entry to append. For all other files, output the complete file content.",
+    "Do not generate wiki/index.md or wiki/overview.md. The application owns those aggregate files.",
     "Use relative paths from the project root (e.g., wiki/sources/topic.md).",
     "Do not include any other text outside the FILE blocks.",
   ]
@@ -3150,6 +3441,11 @@ export async function executeIngestWrites(
       relativePath.startsWith("wiki/sources/")
     ) {
       relativePath = activeSourceSummaryPath
+    }
+
+    if (!isSafeIngestPath(relativePath) || isAppManagedAggregatePath(relativePath)) {
+      console.warn(`[executeIngestWrites] rejected unsafe or app-managed path: ${relativePath}`)
+      continue
     }
 
     if (

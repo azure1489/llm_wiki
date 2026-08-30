@@ -13,9 +13,8 @@
 import { describe, it, expect } from "vitest"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { readFileSync } from "node:fs"
+import { readFileSync, readdirSync } from "node:fs"
 import en from "./en.json"
-import zh from "./zh.json"
 
 /** Flattens a nested translation object to "a.b.c" dot-path keys. */
 function flattenKeys(obj: unknown, prefix = ""): string[] {
@@ -32,10 +31,32 @@ function flattenKeys(obj: unknown, prefix = ""): string[] {
   return out
 }
 
-describe("i18n bundle parity (en.json ↔ zh.json)", () => {
+function valueAtPath(bundle: unknown, path: string): unknown {
+  let value = bundle
+  for (const part of path.split(".")) {
+    if (value === null || typeof value !== "object") return undefined
+    value = (value as Record<string, unknown>)[part]
+  }
+  return value
+}
+
+function interpolationVariables(value: string): string[] {
+  return [...value.matchAll(/{{\s*([A-Za-z_][\w]*)/g)]
+    .map((match) => match[1])
+    .sort()
+}
+
+describe("i18n bundle parity", () => {
   const i18nDir = dirname(fileURLToPath(import.meta.url))
   const enKeys = new Set(flattenKeys(en))
-  const zhKeys = new Set(flattenKeys(zh))
+  const locales = Object.fromEntries(
+    readdirSync(i18nDir)
+      .filter((fileName) => fileName.endsWith(".json") && fileName !== "en.json")
+      .map((fileName) => [
+        fileName.slice(0, -".json".length),
+        JSON.parse(readFileSync(join(i18nDir, fileName), "utf8")) as unknown,
+      ]),
+  )
 
   it("does not contain duplicate top-level JSON keys", () => {
     const findDuplicates = (fileName: string) => {
@@ -50,24 +71,22 @@ describe("i18n bundle parity (en.json ↔ zh.json)", () => {
       return [...duplicates].sort()
     }
 
-    expect(findDuplicates("en.json"), "duplicate top-level keys in en.json").toEqual([])
-    expect(findDuplicates("zh.json"), "duplicate top-level keys in zh.json").toEqual([])
+    for (const locale of ["en", ...Object.keys(locales)]) {
+      expect(
+        findDuplicates(`${locale}.json`),
+        `duplicate top-level keys in ${locale}.json`,
+      ).toEqual([])
+    }
   })
 
-  it("every en.json key is also in zh.json", () => {
-    const missing = [...enKeys].filter((k) => !zhKeys.has(k)).sort()
-    expect(
-      missing,
-      `Keys in en.json but missing from zh.json — add Chinese translations for:\n  ${missing.join("\n  ")}`,
-    ).toEqual([])
-  })
-
-  it("every zh.json key is also in en.json (no orphaned zh-only strings)", () => {
-    const orphaned = [...zhKeys].filter((k) => !enKeys.has(k)).sort()
-    expect(
-      orphaned,
-      `Keys in zh.json but missing from en.json — either add English translations or remove the stale zh-only keys:\n  ${orphaned.join("\n  ")}`,
-    ).toEqual([])
+  it("every locale has exactly the English key set", () => {
+    for (const [locale, bundle] of Object.entries(locales)) {
+      const keys = new Set(flattenKeys(bundle))
+      const missing = [...enKeys].filter((key) => !keys.has(key)).sort()
+      const orphaned = [...keys].filter((key) => !enKeys.has(key)).sort()
+      expect(missing, `${locale}.json is missing:\n  ${missing.join("\n  ")}`).toEqual([])
+      expect(orphaned, `${locale}.json has orphaned keys:\n  ${orphaned.join("\n  ")}`).toEqual([])
+    }
   })
 
   it("every leaf value is a non-empty string (no null / empty / placeholder slips)", () => {
@@ -84,7 +103,22 @@ describe("i18n bundle parity (en.json ↔ zh.json)", () => {
       }
     }
     check(en, "en.json")
-    check(zh, "zh.json")
+    for (const [locale, bundle] of Object.entries(locales)) check(bundle, `${locale}.json`)
+  })
+
+  it("translated strings preserve English interpolation variables", () => {
+    for (const [locale, bundle] of Object.entries(locales)) {
+      for (const path of enKeys) {
+        const translated = valueAtPath(bundle, path)
+        // Missing/non-string values are reported by the structural tests with
+        // a clearer diagnostic; do not turn them into an unrelated TypeError.
+        if (typeof translated !== "string") continue
+        expect(
+          interpolationVariables(translated),
+          `${locale}.json changes interpolation variables for ${path}`,
+        ).toEqual(interpolationVariables(valueAtPath(en, path) as string))
+      }
+    }
   })
 
   it("pluralization keys come in pairs: every foo_plural has a matching foo", () => {
@@ -103,6 +137,37 @@ describe("i18n bundle parity (en.json ↔ zh.json)", () => {
       }
     }
     check(en, "en.json")
-    check(zh, "zh.json")
+    for (const [locale, bundle] of Object.entries(locales)) check(bundle, `${locale}.json`)
+  })
+
+  it("every literal translation key used by frontend code exists", () => {
+    const srcDir = join(i18nDir, "..")
+    const sourceFiles: string[] = []
+    const visit = (directory: string) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name)
+        if (entry.isDirectory()) visit(path)
+        else if (/\.(?:ts|tsx)$/.test(entry.name) && !entry.name.endsWith(".test.ts")) {
+          sourceFiles.push(path)
+        }
+      }
+    }
+    visit(srcDir)
+
+    const missing = new Set<string>()
+    // Dynamic keys such as `sidebar.typeLabels.${type}` cannot be proven
+    // statically and remain covered by bundle parity plus their fallback.
+    const literalKey = /(?:\bt|i18n\.t)\(\s*["']([^"']+)["']/g
+    for (const file of sourceFiles) {
+      const source = readFileSync(file, "utf8")
+      for (const match of source.matchAll(literalKey)) {
+        if (!enKeys.has(match[1])) missing.add(match[1])
+      }
+    }
+
+    expect(
+      [...missing].sort(),
+      "Literal i18n keys used by frontend code but missing from the bundles",
+    ).toEqual([])
   })
 })

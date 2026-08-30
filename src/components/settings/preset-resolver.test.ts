@@ -94,6 +94,48 @@ describe("resolveConfig", () => {
     expect(resolved.reasoning).toEqual({ mode: "off" })
   })
 
+  it("keeps ingest reasoning separate from chat reasoning", () => {
+    const preset: LlmPreset = {
+      id: "openai",
+      label: "OpenAI",
+      provider: "openai",
+      defaultModel: "gpt-5",
+    }
+
+    const resolved = resolveConfig(
+      preset,
+      {
+        reasoning: { mode: "high" },
+        ingestReasoning: { mode: "low" },
+      },
+      fallbackConfig(),
+    )
+
+    expect(resolved.reasoning).toEqual({ mode: "high" })
+    expect(resolved.ingestReasoning).toEqual({ mode: "low" })
+  })
+
+  it("preserves an explicit non-streaming provider preference", () => {
+    const preset: LlmPreset = {
+      id: "openai",
+      label: "OpenAI",
+      provider: "openai",
+      defaultModel: "gpt-5",
+    }
+
+    expect(resolveConfig(
+      preset,
+      { streamingEnabled: false },
+      fallbackConfig(),
+    ).streamingEnabled).toBe(false)
+    expect(resolveConfig(
+      preset,
+      undefined,
+      fallbackConfig({ streamingEnabled: false }),
+    ).streamingEnabled)
+      .toBeUndefined()
+  })
+
   it("carries Azure API version and model family overrides", () => {
     const preset: LlmPreset = {
       id: "azure",

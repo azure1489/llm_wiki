@@ -1,5 +1,5 @@
 import type { CustomApiMode } from "./llm-presets"
-import type { AzureModelFamily, CloseBehavior, MineruModelVersion, ReasoningConfig, SourceWatchConfig } from "@/stores/wiki-store"
+import type { AzureModelFamily, CloseBehavior, MineruEffort, MineruLocalBackend, MineruModelVersion, MineruParseMethod, ReasoningConfig, SourceWatchConfig } from "@/stores/wiki-store"
 
 /**
  * Shape of the draft state each section reads from and writes into.
@@ -19,6 +19,7 @@ export interface SettingsDraft {
   maxContextSize: number
   apiMode: CustomApiMode | undefined
   reasoning: ReasoningConfig | undefined
+  ingestReasoning: ReasoningConfig | undefined
   localCliIsolation: boolean
 
   // Embedding
@@ -32,6 +33,10 @@ export interface SettingsDraft {
   embeddingMaxChunkChars: number | undefined
   /** Overlap characters between adjacent chunks. Empty = default (200). */
   embeddingOverlapChunkChars: number | undefined
+  /** Maximum number of embedding requests in flight. */
+  embeddingConcurrency: number
+  /** Inputs per request for OpenAI-compatible batch endpoints. */
+  embeddingBatchSize: number
   /** Extra HTTP headers to send on every embedding request. Empty = none. */
   embeddingExtraHeaders: Record<string, string>
 
@@ -58,6 +63,7 @@ export interface SettingsDraft {
   proxyEnabled: boolean
   proxyUrl: string
   proxyBypassLocal: boolean
+  proxyAcceptInvalidCerts: boolean
 
   // Scheduled Import
   scheduledImportEnabled: boolean
@@ -78,6 +84,17 @@ export interface SettingsDraft {
 
   // MinerU PDF parsing
   mineruEnabled: boolean
+  mineruBackend: "cloud" | "local"
+  mineruLocalEndpoint: string
+  mineruLocalToken: string
+  mineruLocalBackend: MineruLocalBackend
+  mineruLocalEffort: MineruEffort
+  mineruLocalParseMethod: MineruParseMethod
+  mineruLocalLanguage: string
+  mineruLocalFormulaEnabled: boolean
+  mineruLocalTableEnabled: boolean
+  mineruLocalImageAnalysis: boolean
+  mineruLocalServerUrl: string
   mineruToken: string
   mineruModelVersion: MineruModelVersion
 

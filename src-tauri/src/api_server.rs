@@ -1,20 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Manager};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::cors::{local_cors_headers, request_origin};
-use crate::{clip_server, commands, server_bind};
+use crate::{agent, clip_server, commands, server_bind};
 
 const DEFAULT_PORT: u16 = 19828;
 const API_PREFIX: &str = "/api/v1";
@@ -42,6 +45,7 @@ fn bind_port() -> u16 {
         .unwrap_or(DEFAULT_PORT)
 }
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_CHAT_BODY_BYTES: usize = 40 * 1024 * 1024;
 const MAX_FILE_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_MAX_FILES: usize = 2_000;
 const HARD_MAX_FILES: usize = 10_000;
@@ -54,10 +58,16 @@ const APP_STATE_CACHE_TTL: Duration = Duration::from_secs(5);
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
 const RATE_LIMIT_MAX_REQUESTS: usize = 120;
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+const MAX_IN_FLIGHT_CHAT_STREAMS: usize = 8;
+const MAX_IN_FLIGHT_PAGE_EMBEDS: usize = 4;
+const SSE_QUEUE_CAPACITY: usize = 64;
+const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// API status: 0=starting, 1=running, 2=port_conflict, 3=error
 static API_STATUS: AtomicU8 = AtomicU8::new(0);
 static IN_FLIGHT_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static IN_FLIGHT_CHAT_STREAMS: AtomicUsize = AtomicUsize::new(0);
+static IN_FLIGHT_PAGE_EMBEDS: AtomicUsize = AtomicUsize::new(0);
 static APP_STATE_CACHE: OnceLock<Mutex<Option<CachedAppState>>> = OnceLock::new();
 static RATE_LIMIT: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
 
@@ -156,6 +166,32 @@ impl Drop for RequestSlot {
     }
 }
 
+struct ChatStreamSlot;
+
+impl Drop for ChatStreamSlot {
+    fn drop(&mut self) {
+        IN_FLIGHT_CHAT_STREAMS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn try_acquire_chat_stream_slot() -> Option<ChatStreamSlot> {
+    let mut current = IN_FLIGHT_CHAT_STREAMS.load(Ordering::Relaxed);
+    loop {
+        if current >= MAX_IN_FLIGHT_CHAT_STREAMS {
+            return None;
+        }
+        match IN_FLIGHT_CHAT_STREAMS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(ChatStreamSlot),
+            Err(next) => current = next,
+        }
+    }
+}
+
 fn try_acquire_request_slot() -> Option<RequestSlot> {
     let mut current = IN_FLIGHT_REQUESTS.load(Ordering::Relaxed);
     loop {
@@ -194,13 +230,54 @@ fn process_request(app: AppHandle, mut request: tiny_http::Request) {
         })
         .collect();
 
-    let body = match read_body(&mut request) {
+    let body = match read_body(&mut request, body_limit_for_request(&method, &url)) {
         Ok(body) => body,
         Err(err) => {
             respond_error(request, 400, &err, origin.as_deref());
             return;
         }
     };
+
+    let (path, query) = split_url(&url);
+    if wants_streaming_chat(&method, &path, &body, &headers) {
+        if !api_enabled(&app) {
+            respond_error(
+                request,
+                503,
+                "API server is disabled in Settings → API Server",
+                origin.as_deref(),
+            );
+            return;
+        }
+        // Agent chat remains token-protected even when read-oriented API
+        // endpoints are configured for unauthenticated local access.
+        if !is_token_authorized(&app, query, &headers) {
+            respond_error(request, 401, "Unauthorized", origin.as_deref());
+            return;
+        }
+        let Some(project_id) = chat_project_id(&method, &path) else {
+            respond_error(request, 404, "Not found", origin.as_deref());
+            return;
+        };
+        let Some(stream_slot) = try_acquire_chat_stream_slot() else {
+            respond_error(
+                request,
+                503,
+                "Too many concurrent Agent chat streams",
+                origin.as_deref(),
+            );
+            return;
+        };
+        respond_chat_sse(
+            request,
+            app,
+            project_id,
+            &body,
+            origin.as_deref(),
+            stream_slot,
+        );
+        return;
+    }
 
     let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handle_request(&app, &method, &url, &body, &headers)
@@ -253,6 +330,11 @@ fn handle_request(
             "mcpEnabled": api_mcp_enabled(app),
             "allowUnauthenticated": api_allow_unauthenticated(app),
             "allowLanAccess": api_allow_lan_access(app),
+            "agent": {
+                "chat": true,
+                "streaming": true,
+                "streamProtocol": "sse",
+            },
         }));
     }
     if !path.starts_with(API_PREFIX) {
@@ -266,6 +348,9 @@ fn handle_request(
         // retry instantly the way 401 would.
         return err(503, "API server is disabled in Settings → API Server");
     }
+    if is_token_required_request(&method, &path) && !is_token_authorized(app, query, headers) {
+        return err(401, "Unauthorized");
+    }
     if !is_authorized(app, query, headers) {
         return err(401, "Unauthorized");
     }
@@ -273,12 +358,9 @@ fn handle_request(
         return err(405, "Method not allowed");
     }
 
-    let parts: Vec<&str> = path
-        .trim_start_matches(API_PREFIX)
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect();
+    let Some(parts) = api_path_parts(&path) else {
+        return err(404, "Not found");
+    };
 
     match (method, parts.as_slice()) {
         (&Method::Get, ["projects"]) => handle_projects(app),
@@ -303,9 +385,12 @@ fn handle_request(
         (&Method::Post, ["projects", project_id, "sources", "rescan"]) => {
             handle_rescan(app, project_id)
         }
-        (&Method::Post, ["projects", project_id, "chat"]) => {
-            let _ = project_id;
-            err(501, "Chat API is not implemented in the local Rust API server yet. The existing chat/RAG pipeline currently lives in the WebView; expose it after moving the shared chat pipeline behind a backend command.")
+        (&Method::Post, ["projects", project_id, "pages", "embed"]) => {
+            handle_embed_page(app, project_id, body)
+        }
+        (&Method::Post, ["projects", project_id, "chat"]) => handle_chat(app, project_id, body),
+        (&Method::Post, ["projects", project_id, "chat", session_id, "cancel"]) => {
+            handle_cancel_chat(app, project_id, session_id)
         }
         _ => err(404, "Not found"),
     }
@@ -336,13 +421,99 @@ fn allow_request() -> bool {
     true
 }
 
-fn read_body(request: &mut tiny_http::Request) -> Result<String, String> {
-    let mut limited = request.as_reader().take(MAX_BODY_BYTES as u64 + 1);
+fn is_agent_chat_request(method: &Method, path: &str) -> bool {
+    let Some(parts) = api_path_parts(path) else {
+        return false;
+    };
+    method == &Method::Post
+        && matches!(
+            parts.as_slice(),
+            ["projects", _, "chat"] | ["projects", _, "chat", _, "cancel"]
+        )
+}
+
+fn is_token_required_request(method: &Method, path: &str) -> bool {
+    if is_agent_chat_request(method, path) {
+        return true;
+    }
+    let Some(parts) = api_path_parts(path) else {
+        return false;
+    };
+    method == &Method::Post && matches!(parts.as_slice(), ["projects", _, "pages", "embed"])
+}
+
+fn chat_project_id<'a>(method: &Method, path: &'a str) -> Option<&'a str> {
+    if method != &Method::Post {
+        return None;
+    }
+    let parts = api_path_parts(path)?;
+    match parts.as_slice() {
+        ["projects", project_id, "chat"] => Some(*project_id),
+        _ => None,
+    }
+}
+
+fn api_path_parts(path: &str) -> Option<Vec<&str>> {
+    let remainder = path.strip_prefix(API_PREFIX)?;
+    if !remainder.is_empty() && !remainder.starts_with('/') {
+        return None;
+    }
+    Some(
+        remainder
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect(),
+    )
+}
+
+fn wants_streaming_chat(
+    method: &Method,
+    path: &str,
+    body: &str,
+    headers: &[(String, String)],
+) -> bool {
+    if chat_project_id(method, path).is_none() {
+        return false;
+    }
+    let accepts_sse = headers.iter().any(|(key, value)| {
+        key == "accept"
+            && value
+                .split(',')
+                .filter_map(|part| part.trim().split(';').next())
+                .any(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+    });
+    match serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(Value::as_bool))
+    {
+        Some(stream) => stream,
+        None => accepts_sse,
+    }
+}
+
+fn body_limit_for_request(method: &Method, url: &str) -> usize {
+    let (path, _) = split_url(url);
+    let parts = api_path_parts(&path);
+    if method == &Method::Post
+        && parts
+            .as_deref()
+            .map(|parts| matches!(parts, ["projects", _, "chat"]))
+            .unwrap_or(false)
+    {
+        MAX_CHAT_BODY_BYTES
+    } else {
+        MAX_BODY_BYTES
+    }
+}
+
+fn read_body(request: &mut tiny_http::Request, max_body_bytes: usize) -> Result<String, String> {
+    let mut limited = request.as_reader().take(max_body_bytes as u64 + 1);
     let mut bytes = Vec::new();
     limited
         .read_to_end(&mut bytes)
         .map_err(|e| format!("Failed to read body: {e}"))?;
-    if bytes.len() > MAX_BODY_BYTES {
+    if bytes.len() > max_body_bytes {
         return Err("Request body too large".to_string());
     }
     String::from_utf8(bytes).map_err(|_| "Request body must be UTF-8".to_string())
@@ -438,6 +609,14 @@ fn is_authorized(app: &AppHandle, query: &str, headers: &[(String, String)]) -> 
     if !api_auth_required(app) {
         return true;
     }
+    is_token_authorized(app, query, headers)
+}
+
+pub(crate) fn is_token_authorized(
+    app: &AppHandle,
+    query: &str,
+    headers: &[(String, String)],
+) -> bool {
     let Some(token) = api_token(app) else {
         return false;
     };
@@ -1122,17 +1301,7 @@ fn is_text_content_rel(rel: &str) -> bool {
         .unwrap_or("");
     matches!(
         ext,
-        "md" | "mdx"
-            | "txt"
-            | "csv"
-            | "json"
-            | "yaml"
-            | "yml"
-            | "xml"
-            | "html"
-            | "htm"
-            | "rtf"
-            | "log"
+        "md" | "mdx" | "txt" | "csv" | "json" | "yaml" | "yml" | "xml" | "html" | "htm" | "log"
     )
 }
 
@@ -1865,6 +2034,75 @@ struct SearchRequest {
     query_embedding: Option<Vec<f32>>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EmbedPageRequest {
+    path: String,
+    #[serde(default)]
+    force: bool,
+}
+
+struct PageEmbedSlot;
+
+impl Drop for PageEmbedSlot {
+    fn drop(&mut self) {
+        IN_FLIGHT_PAGE_EMBEDS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn try_acquire_page_embed_slot() -> Option<PageEmbedSlot> {
+    IN_FLIGHT_PAGE_EMBEDS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current < MAX_IN_FLIGHT_PAGE_EMBEDS).then_some(current + 1)
+        })
+        .ok()
+        .map(|_| PageEmbedSlot)
+}
+
+fn handle_embed_page(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    let req: EmbedPageRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => return err(400, format!("Invalid JSON: {e}")),
+    };
+    if req.path.trim().is_empty() {
+        return err(400, "path is required");
+    }
+    let Some(config) = load_embedding_config(app) else {
+        return err(400, "Embedding is not configured");
+    };
+    let Some(_slot) = try_acquire_page_embed_slot() else {
+        return err(503, "Too many page indexing requests are already running");
+    };
+    let result = tauri::async_runtime::block_on(commands::page_embedding::embed_wiki_page(
+        &project.path,
+        &req.path,
+        config,
+        req.force,
+    ));
+    match result {
+        Ok(result) => ok(json!({
+            "ok": true,
+            "projectId": project.id,
+            "result": result,
+        })),
+        Err(error) => {
+            let status = match error.kind {
+                commands::page_embedding::PageEmbeddingErrorKind::InvalidRequest => 400,
+                commands::page_embedding::PageEmbeddingErrorKind::NotFound => 404,
+                commands::page_embedding::PageEmbeddingErrorKind::Provider => 502,
+                commands::page_embedding::PageEmbeddingErrorKind::Storage => 500,
+                commands::page_embedding::PageEmbeddingErrorKind::Conflict => 409,
+                commands::page_embedding::PageEmbeddingErrorKind::Timeout => 504,
+            };
+            err(status, error.message)
+        }
+    }
+}
+
 fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
     let project = match resolve_project(app, project_id) {
         Ok(project) => project,
@@ -1899,19 +2137,497 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
             "ok": true,
             "projectId": project.id,
             "mode": search.mode,
-            "note": "Search uses the shared backend retrieval service. When embeddingConfig is enabled, the API automatically includes LanceDB vector results; clients may also pass queryEmbedding explicitly.",
+            "note": "Search uses the shared backend hybrid retrieval service, combining keyword, vector, and one-hop knowledge-graph candidates. When embeddingConfig is enabled, the API automatically includes LanceDB vector results; clients may also pass queryEmbedding explicitly.",
             "tokenHits": search.token_hits,
             "vectorHits": search.vector_hits,
+            "graphHits": search.graph_hits,
             "results": search.results,
         })),
         Err(e) => err(500, e),
     }
 }
 
+struct PreparedChat {
+    project: ProjectEntry,
+    request: agent::AgentChatRequest,
+    runtime: agent::AgentRuntime,
+    user_message: String,
+    persist_session: bool,
+    session_id: String,
+    run_id: String,
+    cancellation: Option<agent::cancel::AgentCancellationToken>,
+}
+
+fn prepare_chat(
+    app: &AppHandle,
+    project_id: &str,
+    body: &str,
+) -> Result<PreparedChat, ApiResponse> {
+    let project = resolve_project(app, project_id).map_err(|e| err(404, e))?;
+    let mut req: agent::AgentChatRequest =
+        serde_json::from_str(body).map_err(|e| err(400, format!("Invalid JSON: {e}")))?;
+    if req.message.trim().is_empty() {
+        return Err(err(400, "message is required"));
+    }
+    if req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        req.session_id = Some(format!("api_{}", Uuid::new_v4()));
+    }
+    if req
+        .run_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        req.run_id = Some(format!("run_{}", Uuid::new_v4()));
+    }
+    let requested_session_id = req.session_id.clone();
+    if let Some(session_id) = requested_session_id.as_deref() {
+        if req.history.is_empty() && !req.history_explicit {
+            req.history = app
+                .state::<agent::session::AgentSessionStore>()
+                .recent_messages(&project.path, session_id, 12)
+                .into_iter()
+                .map(|message| agent::types::AgentConversationMessage {
+                    role: message.role,
+                    content: message.content,
+                })
+                .collect();
+        }
+    }
+    let runtime_config = load_agent_runtime_config(app, Some(&project.id));
+    let runtime = agent::AgentRuntime::new(
+        project.id.clone(),
+        project.path.clone(),
+        runtime_config.embedding,
+        runtime_config.llm,
+        runtime_config.web_search,
+        runtime_config.anytxt,
+    );
+    let user_message_for_session = req.message.clone();
+    let persist_session = req.persist_session;
+    let session_id = req.session_id.clone().unwrap_or_default();
+    let run_id = req.run_id.clone().unwrap_or_default();
+    let cancellation = app
+        .state::<agent::cancel::AgentCancellationRegistry>()
+        .start(&project.id, &session_id, &run_id);
+    Ok(PreparedChat {
+        project,
+        request: req,
+        runtime,
+        user_message: user_message_for_session,
+        persist_session,
+        session_id,
+        run_id,
+        cancellation: Some(cancellation),
+    })
+}
+
+fn persist_chat_response(
+    app: &AppHandle,
+    prepared: &PreparedChat,
+    response: &agent::types::AgentChatResponse,
+) {
+    if prepared.persist_session {
+        app.state::<agent::session::AgentSessionStore>()
+            .append_turn(
+                &prepared.project.path,
+                &prepared.project.id,
+                &response.session_id,
+                &prepared.user_message,
+                &response.message,
+            );
+    }
+}
+
+fn external_chat_response(mut response: agent::types::AgentChatResponse) -> Value {
+    for event in &mut response.events {
+        event.redact_for_external_api();
+    }
+    json!({
+        "ok": true,
+        "projectId": response.project_id,
+        "sessionId": response.session_id,
+        "mode": response.mode,
+        "message": {
+            "role": "assistant",
+            "content": response.message,
+        },
+        "references": response.references,
+        "toolEvents": response.tool_events,
+        "events": response.events,
+        "usage": response.usage,
+    })
+}
+
+fn handle_chat(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
+    let mut prepared = match prepare_chat(app, project_id, body) {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let result = tauri::async_runtime::block_on(prepared.runtime.run_once_with_cancel(
+        std::mem::take(&mut prepared.request),
+        prepared.cancellation.take(),
+    ));
+    app.state::<agent::cancel::AgentCancellationRegistry>()
+        .finish(&prepared.project.id, &prepared.session_id, &prepared.run_id);
+    match result {
+        Ok(response) => {
+            persist_chat_response(app, &prepared, &response);
+            ok(external_chat_response(response))
+        }
+        Err(e) if e == "message is required" => err(400, e),
+        Err(e) if e == "Agent turn cancelled" => err(499, e),
+        Err(e) => err(502, e),
+    }
+}
+
+struct SseReader {
+    receiver: Receiver<Vec<u8>>,
+    current: Cursor<Vec<u8>>,
+}
+
+impl SseReader {
+    fn new(receiver: Receiver<Vec<u8>>) -> Self {
+        Self {
+            receiver,
+            current: Cursor::new(Vec::new()),
+        }
+    }
+}
+
+impl Read for SseReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let read = self.current.read(buffer)?;
+            if read > 0 {
+                return Ok(read);
+            }
+            match self.receiver.recv() {
+                Ok(chunk) => self.current = Cursor::new(chunk),
+                Err(_) => return Ok(0),
+            }
+        }
+    }
+}
+
+fn sse_frame(event: &str, data: &Value) -> Vec<u8> {
+    format!("event: {event}\ndata: {}\n\n", data).into_bytes()
+}
+
+enum SseSendResult {
+    Sent,
+    Full,
+    Disconnected,
+}
+
+fn try_send_sse(sender: &SyncSender<Vec<u8>>, frame: Vec<u8>) -> SseSendResult {
+    match sender.try_send(frame) {
+        Ok(()) => SseSendResult::Sent,
+        Err(mpsc::TrySendError::Full(_)) => SseSendResult::Full,
+        Err(mpsc::TrySendError::Disconnected(_)) => SseSendResult::Disconnected,
+    }
+}
+
+fn send_terminal_sse(sender: SyncSender<Vec<u8>>, frame: Vec<u8>) {
+    // A terminal frame must not be dropped when the bounded queue is briefly
+    // full, but blocking a Tokio worker would stall unrelated app work. Use a
+    // short-lived writer thread; send unblocks when the socket drains or the
+    // request reader is dropped after a disconnect.
+    thread::spawn(move || {
+        let _ = sender.send(frame);
+    });
+}
+
+fn respond_chat_sse(
+    request: tiny_http::Request,
+    app: AppHandle,
+    project_id: &str,
+    body: &str,
+    origin: Option<&str>,
+    _stream_slot: ChatStreamSlot,
+) {
+    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prepare_chat(&app, project_id, body)
+    }));
+    let mut prepared = match prepared {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(response)) => {
+            respond_json(request, response.status, response.body, origin);
+            return;
+        }
+        Err(_) => {
+            respond_error(request, 500, "Internal API server error", origin);
+            return;
+        }
+    };
+    let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(SSE_QUEUE_CAPACITY);
+    let _ = try_send_sse(
+        &sender,
+        sse_frame(
+            "meta",
+            &json!({
+                "projectId": prepared.project.id,
+                "sessionId": prepared.session_id,
+                "runId": prepared.run_id,
+            }),
+        ),
+    );
+
+    let (heartbeat_stop, heartbeat_done) = mpsc::channel::<()>();
+    let heartbeat_sender = sender.clone();
+    let heartbeat_registry = app
+        .state::<agent::cancel::AgentCancellationRegistry>()
+        .inner()
+        .clone();
+    let heartbeat_project = prepared.project.id.clone();
+    let heartbeat_session = prepared.session_id.clone();
+    let heartbeat_run = prepared.run_id.clone();
+    thread::spawn(move || loop {
+        match heartbeat_done.recv_timeout(SSE_HEARTBEAT_INTERVAL) {
+            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                match try_send_sse(&heartbeat_sender, b": keepalive\n\n".to_vec()) {
+                    SseSendResult::Disconnected => {
+                        heartbeat_registry.cancel(
+                            &heartbeat_project,
+                            &heartbeat_session,
+                            Some(&heartbeat_run),
+                        );
+                        break;
+                    }
+                    SseSendResult::Sent | SseSendResult::Full => {}
+                }
+            }
+        }
+    });
+
+    let task_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let event_sender = sender.clone();
+        let registry = task_app
+            .state::<agent::cancel::AgentCancellationRegistry>()
+            .inner()
+            .clone();
+        let cancel_project = prepared.project.id.clone();
+        let cancel_session = prepared.session_id.clone();
+        let cancel_run = prepared.run_id.clone();
+        let sink: agent::runtime::AgentEventSink = std::sync::Arc::new(move |mut event| {
+            event.redact_for_external_api();
+            let payload = serde_json::to_value(event)
+                .unwrap_or_else(|err| json!({ "type": "error", "message": err.to_string() }));
+            match try_send_sse(&event_sender, sse_frame("agent", &payload)) {
+                SseSendResult::Disconnected => {
+                    registry.cancel(&cancel_project, &cancel_session, Some(&cancel_run));
+                }
+                // Intermediate events may be dropped for a temporarily slow
+                // client. The terminal `done` frame still carries the complete
+                // aggregate response, so correctness is preserved.
+                SseSendResult::Sent | SseSendResult::Full => {}
+            }
+        });
+        let result =
+            std::panic::AssertUnwindSafe(prepared.runtime.run_once_with_cancel_and_events(
+                std::mem::take(&mut prepared.request),
+                prepared.cancellation.take(),
+                Some(sink),
+            ))
+            .catch_unwind()
+            .await;
+        task_app
+            .state::<agent::cancel::AgentCancellationRegistry>()
+            .finish(&prepared.project.id, &prepared.session_id, &prepared.run_id);
+        match result {
+            Ok(Ok(response)) => {
+                persist_chat_response(&task_app, &prepared, &response);
+                send_terminal_sse(
+                    sender.clone(),
+                    sse_frame("done", &external_chat_response(response)),
+                );
+            }
+            Ok(Err(message)) => {
+                let event = if message == "Agent turn cancelled" {
+                    "cancelled"
+                } else {
+                    "error"
+                };
+                send_terminal_sse(
+                    sender.clone(),
+                    sse_frame(event, &json!({ "ok": false, "error": message })),
+                );
+            }
+            Err(_) => {
+                send_terminal_sse(
+                    sender.clone(),
+                    sse_frame(
+                        "error",
+                        &json!({ "ok": false, "error": "Agent chat task panicked" }),
+                    ),
+                );
+            }
+        }
+        let _ = heartbeat_stop.send(());
+    });
+
+    let mut response = Response::new(
+        StatusCode(200),
+        vec![
+            Header::from_bytes("Content-Type", "text/event-stream; charset=utf-8").unwrap(),
+            Header::from_bytes("Cache-Control", "no-cache, no-transform").unwrap(),
+            Header::from_bytes("X-Accel-Buffering", "no").unwrap(),
+        ],
+        SseReader::new(receiver),
+        None,
+        None,
+    );
+    for header in cors_headers(origin) {
+        response.add_header(header);
+    }
+    let _ = request.respond(response);
+}
+
+fn handle_cancel_chat(app: &AppHandle, project_id: &str, session_id: &str) -> ApiResponse {
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+    ok(json!({
+        "ok": true,
+        "cancelled": app
+            .state::<agent::cancel::AgentCancellationRegistry>()
+            .cancel(&project.id, session_id, None),
+        "sessionId": session_id,
+    }))
+}
+
 fn load_embedding_config(app: &AppHandle) -> Option<commands::search::SearchEmbeddingConfig> {
     let parsed = load_app_state(app)?;
     let value = parsed.get("embeddingConfig")?.clone();
     serde_json::from_value::<commands::search::SearchEmbeddingConfig>(value).ok()
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentRuntimeConfig {
+    embedding: Option<commands::search::SearchEmbeddingConfig>,
+    llm: Option<agent::provider::LlmConfig>,
+    web_search: Option<agent::tools::WebSearchConfig>,
+    anytxt: Option<agent::tools::AnyTxtConfig>,
+}
+
+fn project_llm_config(parsed: &Value, project_id: &str) -> Option<agent::provider::LlmConfig> {
+    let global = parsed.get("llmConfig").cloned();
+    let Some(project) = parsed
+        .get("projectLlmOverrides")
+        .and_then(|value| value.get(project_id))
+    else {
+        return global.and_then(|value| serde_json::from_value(value).ok());
+    };
+    if project.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return global.and_then(|value| serde_json::from_value(value).ok());
+    }
+
+    // The frontend persists a resolved, non-secret profile. Merge the current
+    // provider override here so credential rotation and endpoint edits apply to
+    // native API calls without duplicating API keys in every project record.
+    let mut profile = project.get("profile")?.clone();
+    let profile_object = profile.as_object_mut()?;
+    let preset_id = project.get("presetId").and_then(Value::as_str)?;
+    let provider = parsed
+        .get("providerConfigs")
+        .and_then(|value| value.get(preset_id))
+        .and_then(Value::as_object);
+    // `customLlmPresets` is the authoritative registry. A stale providerConfigs
+    // entry may survive an interrupted multi-key settings save, so credentials
+    // alone must not resurrect a deleted custom preset.
+    let custom_preset_exists = parsed
+        .get("customLlmPresets")
+        .and_then(Value::as_array)
+        .map(|presets| {
+            presets
+                .iter()
+                .any(|preset| preset.get("id").and_then(Value::as_str) == Some(preset_id))
+        })
+        .unwrap_or(false);
+    // Match resolveProjectLlmConfig in src/lib/llm-task-routing.ts: deleting a
+    // custom preset must make every project that referenced it fall back to
+    // the global config, including projects that are not currently open.
+    if preset_id.starts_with("custom-") && !custom_preset_exists {
+        return global.and_then(|value| serde_json::from_value(value).ok());
+    }
+    if let Some(provider) = provider {
+        for key in [
+            "apiKey",
+            "apiMode",
+            "azureApiVersion",
+            "maxContextSize",
+            "reasoning",
+            "streamingEnabled",
+            "customHeaders",
+        ] {
+            if let Some(value) = provider.get(key) {
+                profile_object.insert(key.to_string(), value.clone());
+            }
+        }
+        if project
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            if let Some(value) = provider.get("model") {
+                profile_object.insert("model".to_string(), value.clone());
+            }
+        }
+        if let Some(value) = provider.get("baseUrl") {
+            let endpoint_key =
+                if profile_object.get("provider").and_then(Value::as_str) == Some("ollama") {
+                    "ollamaUrl"
+                } else {
+                    "customEndpoint"
+                };
+            profile_object.insert(endpoint_key.to_string(), value.clone());
+        }
+    }
+    serde_json::from_value(profile).ok()
+}
+
+fn load_agent_runtime_config(app: &AppHandle, project_id: Option<&str>) -> AgentRuntimeConfig {
+    let Some(parsed) = load_app_state(app) else {
+        return AgentRuntimeConfig::default();
+    };
+    AgentRuntimeConfig {
+        embedding: parsed
+            .get("embeddingConfig")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        llm: project_id
+            .and_then(|id| project_llm_config(&parsed, id))
+            .or_else(|| {
+                parsed
+                    .get("llmConfig")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+            }),
+        web_search: parsed
+            .get("searchApiConfig")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        anytxt: parsed
+            .get("searchApiConfig")
+            .and_then(|value| value.get("anyTxt"))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2727,6 +3443,7 @@ mod tests {
         assert!(is_text_content_rel("wiki/index.md"));
         assert!(!is_text_content_rel("wiki/media/image.png"));
         assert!(!is_text_content_rel("raw/sources/book.pdf"));
+        assert!(!is_text_content_rel("raw/sources/notes.rtf"));
     }
 
     #[test]
@@ -2746,6 +3463,171 @@ mod tests {
             &Method::Post,
             "/api/v1/projects/current/search"
         ));
+    }
+
+    #[test]
+    fn chat_endpoint_allows_larger_multimodal_bodies() {
+        assert_eq!(
+            body_limit_for_request(&Method::Post, "/api/v1/projects/current/chat"),
+            MAX_CHAT_BODY_BYTES
+        );
+        assert_eq!(
+            body_limit_for_request(&Method::Post, "/api/v1/projects/current/search"),
+            MAX_BODY_BYTES
+        );
+    }
+
+    #[test]
+    fn chat_routes_are_recognized_as_agent_requests() {
+        assert!(is_agent_chat_request(
+            &Method::Post,
+            "/api/v1/projects/current/chat"
+        ));
+        assert!(is_agent_chat_request(
+            &Method::Post,
+            "/api/v1/projects/current/chat/session-1/cancel"
+        ));
+        assert!(!is_agent_chat_request(
+            &Method::Post,
+            "/api/v1/projects/current/search"
+        ));
+        assert!(!is_agent_chat_request(
+            &Method::Get,
+            "/api/v1/projects/current/chat"
+        ));
+    }
+
+    #[test]
+    fn paid_or_mutating_agent_routes_always_require_a_token() {
+        assert!(is_token_required_request(
+            &Method::Post,
+            "/api/v1/projects/current/pages/embed"
+        ));
+        assert!(is_token_required_request(
+            &Method::Post,
+            "/api/v1/projects/current/chat"
+        ));
+        assert!(!is_token_required_request(
+            &Method::Post,
+            "/api/v1/projects/current/search"
+        ));
+        assert!(!is_token_required_request(
+            &Method::Get,
+            "/api/v1/projects/current/pages/embed"
+        ));
+    }
+
+    #[test]
+    fn chat_streaming_is_enabled_by_body_or_accept_header() {
+        let path = "/api/v1/projects/current/chat";
+        assert!(wants_streaming_chat(
+            &Method::Post,
+            path,
+            r#"{"message":"hello","stream":true}"#,
+            &[],
+        ));
+        assert!(wants_streaming_chat(
+            &Method::Post,
+            path,
+            r#"{"message":"hello"}"#,
+            &[(
+                "accept".to_string(),
+                "application/json, text/event-stream; q=0.9".to_string(),
+            )],
+        ));
+        assert!(!wants_streaming_chat(
+            &Method::Post,
+            path,
+            r#"{"message":"hello","stream":false}"#,
+            &[],
+        ));
+        assert!(!wants_streaming_chat(
+            &Method::Post,
+            path,
+            r#"{"message":"hello","stream":false}"#,
+            &[("accept".to_string(), "text/event-stream".to_string())],
+        ));
+        assert!(!wants_streaming_chat(
+            &Method::Post,
+            "/api/v1/projects/current/search",
+            r#"{"stream":true}"#,
+            &[],
+        ));
+        assert!(!wants_streaming_chat(
+            &Method::Post,
+            "/api/v1/projects/current/chat/s1/cancel",
+            r#"{"stream":true}"#,
+            &[],
+        ));
+        assert!(!wants_streaming_chat(
+            &Method::Post,
+            "/projects/current/chat",
+            r#"{"stream":true}"#,
+            &[],
+        ));
+        assert!(!wants_streaming_chat(
+            &Method::Post,
+            "/api/v1/api/v1/projects/current/chat",
+            r#"{"stream":true}"#,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn sse_reader_preserves_event_frames_until_sender_closes() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        sender
+            .send(sse_frame("meta", &json!({ "sessionId": "s1" })))
+            .unwrap();
+        sender
+            .send(sse_frame(
+                "agent",
+                &json!({ "type": "messageDelta", "text": "Hi" }),
+            ))
+            .unwrap();
+        drop(sender);
+
+        let mut body = String::new();
+        let mut reader = SseReader::new(receiver);
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        reader.read_to_string(&mut body).unwrap();
+        assert!(body.contains("event: meta\n"));
+        assert!(body.contains(r#"data: {"sessionId":"s1"}"#));
+        assert!(body.contains("event: agent\n"));
+        assert!(body.contains(r#""type":"messageDelta""#));
+    }
+
+    #[test]
+    fn sse_queue_rejects_backpressure_without_blocking_runtime_threads() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        assert!(matches!(
+            try_send_sse(&sender, b"first".to_vec()),
+            SseSendResult::Sent
+        ));
+        assert!(matches!(
+            try_send_sse(&sender, b"second".to_vec()),
+            SseSendResult::Full
+        ));
+    }
+
+    #[test]
+    fn sse_queue_reports_disconnected_clients() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        assert!(matches!(
+            try_send_sse(&sender, b"event".to_vec()),
+            SseSendResult::Disconnected
+        ));
+    }
+
+    #[test]
+    fn terminal_sse_waits_for_queue_capacity() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(b"agent".to_vec()).unwrap();
+        send_terminal_sse(sender, b"done".to_vec());
+
+        assert_eq!(receiver.recv().unwrap(), b"agent");
+        assert_eq!(receiver.recv().unwrap(), b"done");
     }
 
     #[test]
@@ -2816,5 +3698,94 @@ mod tests {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         assert!(!allow_lan_access_missing);
+    }
+
+    #[test]
+    fn project_llm_config_uses_profile_with_current_provider_credentials() {
+        let state = json!({
+            "llmConfig": { "provider": "openai", "apiKey": "global", "model": "gpt-global", "ollamaUrl": "", "customEndpoint": "", "maxContextSize": 1000 },
+            "providerConfigs": {
+                "deepseek": { "apiKey": "rotated", "model": "provider-model", "baseUrl": "https://new.example/v1", "apiMode": "chat_completions", "streamingEnabled": false, "customHeaders": { "X-Tenant-ID": "team-a" } }
+            },
+            "projectLlmOverrides": {
+                "project-a": {
+                    "enabled": true,
+                    "presetId": "deepseek",
+                    "model": "project-model",
+                    "profile": { "provider": "custom", "model": "project-model", "ollamaUrl": "", "customEndpoint": "https://old.example/v1", "maxContextSize": 64000, "apiMode": "chat_completions" }
+                }
+            }
+        });
+        let config = project_llm_config(&state, "project-a").expect("project config");
+        assert_eq!(config.provider, "custom");
+        assert_eq!(config.api_key, "rotated");
+        assert_eq!(config.model, "project-model");
+        assert_eq!(config.custom_endpoint, "https://new.example/v1");
+        assert_eq!(config.streaming_enabled, Some(false));
+        assert_eq!(
+            config.custom_headers.get("X-Tenant-ID").map(String::as_str),
+            Some("team-a")
+        );
+    }
+
+    #[test]
+    fn project_llm_config_falls_back_for_disabled_or_legacy_override() {
+        let state = json!({
+            "llmConfig": { "provider": "openai", "apiKey": "global", "model": "gpt-global", "ollamaUrl": "", "customEndpoint": "", "maxContextSize": 1000 },
+            "projectLlmOverrides": {
+                "disabled": { "enabled": false, "presetId": "anthropic", "model": "claude" },
+                "legacy": { "enabled": true, "presetId": "anthropic", "model": "claude" }
+            }
+        });
+        assert_eq!(
+            project_llm_config(&state, "disabled").unwrap().model,
+            "gpt-global"
+        );
+        assert!(project_llm_config(&state, "legacy").is_none());
+    }
+
+    #[test]
+    fn project_llm_config_falls_back_after_custom_preset_is_deleted() {
+        let state = json!({
+            "llmConfig": { "provider": "openai", "apiKey": "global", "model": "gpt-global", "ollamaUrl": "", "customEndpoint": "", "maxContextSize": 1000 },
+            "providerConfigs": {
+                "custom-deleted": { "apiKey": "stale-secret", "model": "stale-model", "baseUrl": "https://old.example/v1" }
+            },
+            "customLlmPresets": [],
+            "projectLlmOverrides": {
+                "project-b": {
+                    "enabled": true,
+                    "presetId": "custom-deleted",
+                    "model": "stale-model",
+                    "profile": { "provider": "custom", "model": "stale-model", "ollamaUrl": "", "customEndpoint": "https://old.example/v1", "maxContextSize": 64000 }
+                }
+            }
+        });
+        let config = project_llm_config(&state, "project-b").expect("global fallback");
+        assert_eq!(config.model, "gpt-global");
+        assert_eq!(config.api_key, "global");
+    }
+
+    #[test]
+    fn project_llm_config_uses_registered_custom_preset() {
+        let state = json!({
+            "llmConfig": { "provider": "openai", "apiKey": "global", "model": "gpt-global", "ollamaUrl": "", "customEndpoint": "", "maxContextSize": 1000 },
+            "customLlmPresets": [{ "id": "custom-live", "label": "Live" }],
+            "providerConfigs": {
+                "custom-live": { "apiKey": "live-secret", "model": "live-model", "baseUrl": "https://live.example/v1" }
+            },
+            "projectLlmOverrides": {
+                "project-c": {
+                    "enabled": true,
+                    "presetId": "custom-live",
+                    "model": "",
+                    "profile": { "provider": "custom", "model": "old-model", "ollamaUrl": "", "customEndpoint": "https://old.example/v1", "maxContextSize": 64000 }
+                }
+            }
+        });
+        let config = project_llm_config(&state, "project-c").expect("custom config");
+        assert_eq!(config.model, "live-model");
+        assert_eq!(config.api_key, "live-secret");
+        assert_eq!(config.custom_endpoint, "https://live.example/v1");
     }
 }

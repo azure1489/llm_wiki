@@ -38,6 +38,12 @@ async function loadCache(projectPath: string): Promise<CacheData> {
   }
 }
 
+/** Source identities with a recorded successful ingest result. */
+export async function listIngestedSourceIdentities(projectPath: string): Promise<string[]> {
+  const cache = await loadCache(projectPath)
+  return Object.keys(cache.entries)
+}
+
 async function saveCache(projectPath: string, cache: CacheData): Promise<void> {
   try {
     await writeFile(cachePath(projectPath), JSON.stringify(cache, null, 2))
@@ -122,5 +128,24 @@ export async function removeFromIngestCache(
   const cache = await loadCache(projectPath)
   const newEntries = { ...cache.entries }
   delete newEntries[sourceFileName]
+  await saveCache(projectPath, { entries: newEntries })
+}
+
+/** Move a cache entry when an unchanged source is renamed inside raw/sources. */
+export async function moveIngestCacheEntry(
+  projectPath: string,
+  oldSourceIdentity: string,
+  newSourceIdentity: string,
+  movedFiles: ReadonlyMap<string, string> = new Map(),
+): Promise<void> {
+  const cache = await loadCache(projectPath)
+  const entry = cache.entries[oldSourceIdentity]
+  if (!entry || oldSourceIdentity === newSourceIdentity) return
+  const migratedEntry: CacheEntry = {
+    ...entry,
+    filesWritten: entry.filesWritten.map((path) => movedFiles.get(path) ?? path),
+  }
+  const newEntries = { ...cache.entries, [newSourceIdentity]: migratedEntry }
+  delete newEntries[oldSourceIdentity]
   await saveCache(projectPath, { entries: newEntries })
 }

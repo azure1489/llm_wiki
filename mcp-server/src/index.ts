@@ -13,14 +13,18 @@ import {
   type ApiGraphNode,
   type ApiReviewItem,
   type ApiReviewsResponse,
+  type ApiChatResponse,
   type ApiSearchResult,
+  type ApiProject,
 } from "./api-client.js"
 import { VERSION } from "./version.js"
+import { McpProjectBinding, withActiveProject } from "./project-binding.js"
 
 const DEFAULT_PROJECT_ID = "current"
 const MAX_TEXT_BYTES = 120_000
 
 const client = new LlmWikiApiClient()
+const projectBinding = new McpProjectBinding()
 
 const server = new Server(
   { name: "llm-wiki", version: VERSION },
@@ -44,6 +48,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {},
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "llm_wiki_set_project",
+      description: "Pin this MCP process session to one LLM Wiki project. Once pinned, project tools cannot access another project until this tool changes the binding.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project_id: { type: "string", description: "Project UUID, exact filesystem path, or 'current'." },
+        },
+        required: ["project_id"],
         additionalProperties: false,
       },
     },
@@ -104,6 +120,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "llm_wiki_chat",
+      description: "Ask the LLM Wiki backend Agent a question about a project. This initial backend Agent uses the desktop API's shared retrieval service and returns references.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
+          message: { type: "string", description: "User message or question." },
+          session_id: { type: "string", description: "Optional caller-managed session id." },
+          mode: { type: "string", enum: ["fast", "standard", "deep", "local_first"], description: "Agent mode. Defaults to standard." },
+          top_k: { type: "number", description: "Maximum wiki references to retrieve. The API clamps to its configured maximum." },
+          include_content: { type: "boolean", description: "Include full page content in retrieval when supported by the API. Defaults to false." },
+          wiki: { type: "boolean", description: "Enable wiki retrieval. Defaults to true." },
+          web: { type: "boolean", description: "Enable backend web.search when the Agent router decides external search is useful. Defaults to false." },
+          anytxt: { type: "boolean", description: "Enable backend anytxt.search for source/local-file questions when AnyTXT is configured. Defaults to false." },
+          skills: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional project skills to inject from .llm-wiki/skills.",
+          },
+        },
+        required: ["message"],
+        additionalProperties: false,
+      },
+    },
+    {
       name: "llm_wiki_graph",
       description: "Query the project knowledge graph through the desktop app API.",
       inputSchema: {
@@ -128,6 +169,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         additionalProperties: false,
       },
     },
+    {
+      name: "llm_wiki_embed_page",
+      description: "Create or replace the vector index for one existing Markdown page under a project's wiki/ directory.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
+          path: { type: "string", description: "Project-relative Markdown path, for example wiki/ideas/example.md." },
+          force: { type: "boolean", description: "Force rebuilding vectors even when the page content and embedding configuration are unchanged." },
+        },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
   ],
 }))
 
@@ -140,66 +195,110 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           client.health(),
           client.projects().catch(() => ({ projects: [], currentProject: null })),
         ])
-        return textResult(JSON.stringify({ ...health, ...projects }, null, 2))
+        return textResult(JSON.stringify({ ...health, ...projects, sessionProject: projectBinding.project }, null, 2))
       }
       case "llm_wiki_projects": {
         await assertMcpEnabled()
-        return textResult(JSON.stringify(await client.projects(), null, 2))
+        return textResult(JSON.stringify({ ...(await client.projects()), sessionProject: projectBinding.project }, null, 2))
+      }
+      case "llm_wiki_set_project": {
+        await assertMcpEnabled()
+        const requested = stringArg(args.project_id, "project_id")
+        const projects = await client.projects()
+        let pinned: ApiProject
+        try {
+          pinned = projectBinding.pin(requested, projects.projects, projects.currentProject)
+        } catch (error) {
+          throw new McpError(ErrorCode.InvalidParams, scopedErrorMessage(error))
+        }
+        return textResult(JSON.stringify({ activeProject: pinned, pinned: true }, null, 2))
       }
       case "llm_wiki_files": {
         await assertMcpEnabled()
-        const response = await client.files(projectId(args), {
+        const scope = await resolveProjectScope(args)
+        const response = await client.files(scope.id, {
           root: enumArg(args.root, ["wiki", "sources", "all"] as const, "wiki"),
           recursive: boolArg(args.recursive, true),
           maxFiles: numberArg(args.max_files),
         })
-        return textResult(formatFileTree(response.files, response.truncated))
+        return textResult(withActiveProject(formatFileTree(response.files, response.truncated), scope.project, scope.id))
       }
       case "llm_wiki_read_file": {
         await assertMcpEnabled()
         const relPath = stringArg(args.path, "path")
-        const { path, content } = await client.fileContent(projectId(args), relPath)
-        return textResult(`# ${path}\n\n${truncateText(content, MAX_TEXT_BYTES)}`)
+        const scope = await resolveProjectScope(args)
+        const { path, content } = await client.fileContent(scope.id, relPath)
+        return textResult(withActiveProject(`# ${path}\n\n${truncateText(content, MAX_TEXT_BYTES)}`, scope.project, scope.id))
       }
       case "llm_wiki_reviews": {
         await assertMcpEnabled()
-        const reviews = await client.reviews(projectId(args), {
+        const scope = await resolveProjectScope(args)
+        const reviews = await client.reviews(scope.id, {
           status: enumArg(args.status, ["unresolved", "resolved", "all"] as const, "unresolved"),
           type: optionalStringArg(args.type),
           limit: numberArg(args.limit),
         })
-        return textResult(formatReviews(reviews))
+        return textResult(withActiveProject(formatReviews(reviews), scope.project, scope.id))
       }
       case "llm_wiki_search": {
         await assertMcpEnabled()
         const query = stringArg(args.query, "query")
-        const search = await client.search(projectId(args), query, {
+        const scope = await resolveProjectScope(args)
+        const search = await client.search(scope.id, query, {
           topK: numberArg(args.top_k),
           includeContent: boolArg(args.include_content, false),
         })
-        return textResult(formatSearchResults(query, search))
+        return textResult(withActiveProject(formatSearchResults(query, search), scope.project, scope.id))
+      }
+      case "llm_wiki_chat": {
+        await assertMcpEnabled()
+        const message = stringArg(args.message, "message")
+        const scope = await resolveProjectScope(args)
+        const chat = await client.chat(scope.id, message, {
+          sessionId: optionalStringArg(args.session_id),
+          mode: enumArg(args.mode, ["fast", "standard", "deep", "local_first"] as const, "standard"),
+          topK: numberArg(args.top_k),
+          includeContent: boolArg(args.include_content, false),
+          wiki: boolArg(args.wiki, true),
+          web: boolArg(args.web, false),
+          anytxt: boolArg(args.anytxt, false),
+          skills: stringArrayArg(args.skills),
+          persistSession: optionalStringArg(args.session_id) !== undefined,
+        })
+        return textResult(withActiveProject(formatChatResponse(chat), scope.project, scope.id))
       }
       case "llm_wiki_graph": {
         await assertMcpEnabled()
-        const graph = await client.graph(projectId(args), {
+        const scope = await resolveProjectScope(args)
+        const graph = await client.graph(scope.id, {
           q: optionalStringArg(args.q),
           nodeType: optionalStringArg(args.node_type),
           limit: numberArg(args.limit),
         })
-        return textResult(formatGraph(graph.nodes, graph.edges))
+        return textResult(withActiveProject(formatGraph(graph.nodes, graph.edges), scope.project, scope.id))
       }
       case "llm_wiki_rescan_sources": {
         await assertMcpEnabled()
-        return textResult(JSON.stringify(await client.rescan(projectId(args)), null, 2))
+        const scope = await resolveProjectScope(args)
+        return textResult(withActiveProject(JSON.stringify(await client.rescan(scope.id), null, 2), scope.project, scope.id))
+      }
+      case "llm_wiki_embed_page": {
+        await assertMcpEnabled()
+        const path = stringArg(args.path, "path")
+        const scope = await resolveProjectScope(args)
+        const result = await client.embedPage(path, scope.id, boolArg(args.force, false))
+        return textResult(withActiveProject(JSON.stringify(result, null, 2), scope.project, scope.id))
       }
       default:
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`)
     }
   } catch (err) {
-    if (err instanceof McpError) throw err
+    if (err instanceof McpError) {
+      throw new McpError(err.code, scopedErrorMessage(err.message))
+    }
     throw new McpError(
       ErrorCode.InternalError,
-      err instanceof Error ? err.message : String(err),
+      scopedErrorMessage(err),
     )
   }
 })
@@ -225,8 +324,26 @@ function asObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
-function projectId(args: Record<string, unknown>): string {
-  return optionalStringArg(args.project_id) ?? DEFAULT_PROJECT_ID
+async function resolveProjectScope(args: Record<string, unknown>): Promise<{ id: string; project: ApiProject | null }> {
+  let id: string
+  try {
+    id = projectBinding.resolve(optionalStringArg(args.project_id) ?? undefined)
+  } catch (error) {
+    throw new McpError(ErrorCode.InvalidParams, scopedErrorMessage(error))
+  }
+  if (projectBinding.project) return { id, project: projectBinding.project }
+  const projects = await client.projects()
+  const project = id === DEFAULT_PROJECT_ID
+    ? projects.currentProject
+    : projects.projects.find((candidate) => candidate.id === id || candidate.path === id) ?? null
+  return { id, project }
+}
+
+function scopedErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const project = projectBinding.project
+  if (!project || message.includes("[activeProject:")) return message
+  return `[activeProject: ${project.name} (${project.id})] ${message}`
 }
 
 function stringArg(value: unknown, name: string): string {
@@ -250,6 +367,11 @@ function numberArg(value: unknown): number | undefined {
 
 function enumArg<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
   return typeof value === "string" && allowed.includes(value as T) ? value as T : fallback
+}
+
+function stringArrayArg(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value.filter((item): item is string => typeof item === "string" && item.trim() !== "")
 }
 
 function truncateText(value: string, maxBytes: number): string {
@@ -301,6 +423,43 @@ function formatSearchResults(query: string, search: { results: ApiSearchResult[]
     }
     lines.push("")
   })
+  return lines.join("\n")
+}
+
+function formatChatResponse(chat: ApiChatResponse): string {
+  const lines = [
+    "# LLM Wiki Agent response",
+    "",
+    `Session: ${chat.sessionId || "(none)"}`,
+    chat.mode ? `Mode: ${chat.mode}` : null,
+    chat.projectId ? `Project: ${chat.projectId}` : null,
+    chat.usage
+      ? `Usage: promptChars=${chat.usage.promptChars ?? 0}, completionChars=${chat.usage.completionChars ?? 0}, references=${chat.usage.referenceCount ?? chat.references.length}`
+      : null,
+    "",
+    chat.message.content || "(empty response)",
+    "",
+  ].filter((line): line is string => line !== null)
+
+  if (chat.references.length > 0) {
+    lines.push("## References")
+    chat.references.forEach((reference, index) => {
+      lines.push(`${index + 1}. ${reference.title || reference.path}`)
+      lines.push(`   Kind: ${reference.kind}`)
+      lines.push(`   Path: ${reference.path}`)
+      if (typeof reference.score === "number") lines.push(`   Score: ${reference.score.toFixed(6)}`)
+      if (reference.snippet) lines.push(`   Snippet: ${reference.snippet}`)
+    })
+    lines.push("")
+  }
+
+  if (chat.toolEvents.length > 0) {
+    lines.push("## Tool events")
+    chat.toolEvents.forEach((event) => {
+      lines.push(`- ${event.tool}: ${event.status}${event.detail ? ` (${event.detail})` : ""}`)
+    })
+  }
+
   return lines.join("\n")
 }
 

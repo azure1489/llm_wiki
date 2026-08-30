@@ -144,13 +144,23 @@ describe("auto-save project-switch guard", () => {
       useWebSearch: false,
       useAnyTxtSearch: false,
       agentMode: "standard",
+      retrievalMode: "standard",
+      selectedSkills: [],
+      disabledSkills: [],
     })
     expect(saveReviewItems).toHaveBeenCalled()
   })
 
   it("persists chat search preferences on flush", async () => {
     setProjectPath("/proj/A")
-    useChatStore.setState({ useWebSearch: true, useAnyTxtSearch: true, agentMode: "local_first" })
+    useChatStore.setState({
+      useWebSearch: true,
+      useAnyTxtSearch: true,
+      agentMode: "local_first",
+      retrievalMode: "smart",
+      selectedSkills: ["reviewer"],
+      disabledSkills: [],
+    })
 
     await flushAndSuspendAutoSave()
 
@@ -158,6 +168,9 @@ describe("auto-save project-switch guard", () => {
       useWebSearch: true,
       useAnyTxtSearch: true,
       agentMode: "local_first",
+      retrievalMode: "smart",
+      selectedSkills: ["reviewer"],
+      disabledSkills: [],
     })
   })
 })

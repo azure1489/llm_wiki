@@ -67,6 +67,124 @@ test("search posts JSON body to current project", async () => {
   assert.equal(results.results[0]?.vectorScore, 0.9)
 })
 
+test("embedPage posts a project-relative wiki path", async () => {
+  const fetchImpl: typeof fetch = async (input, init) => {
+    assert.equal(String(input), "http://127.0.0.1:19828/api/v1/projects/project-a/pages/embed")
+    assert.equal(init?.method, "POST")
+    assert.deepEqual(JSON.parse(String(init?.body)), { path: "wiki/ideas/page.md", force: true })
+    return new Response(JSON.stringify({
+      ok: true,
+      result: {
+        path: "wiki/ideas/page.md",
+        pageId: "page",
+        revision: "sha256:abc",
+        chunks: 2,
+        vectorsWritten: 2,
+        status: "indexed",
+      },
+    }), { status: 200, headers: { "Content-Type": "application/json" } })
+  }
+  const client = new LlmWikiApiClient({ fetchImpl })
+  assert.deepEqual(await client.embedPage("wiki/ideas/page.md", "project-a", true), {
+    path: "wiki/ideas/page.md",
+    pageId: "page",
+    revision: "sha256:abc",
+    chunks: 2,
+    vectorsWritten: 2,
+    status: "indexed",
+  })
+})
+
+test("embedPage rejects malformed success payloads", async () => {
+  const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({
+    ok: true,
+    result: {
+      path: "wiki/page.md",
+      pageId: "page",
+      revision: "sha256:abc",
+      chunks: "2",
+      vectorsWritten: 2,
+      status: "indexed",
+    },
+  }), { status: 200, headers: { "Content-Type": "application/json" } })
+  const client = new LlmWikiApiClient({ fetchImpl })
+
+  await assert.rejects(
+    () => client.embedPage("wiki/page.md"),
+    /page embedding result\.chunks: expected finite number/,
+  )
+})
+
+test("chat posts agent request and parses references", async () => {
+  let url = ""
+  let body = ""
+  const fetchImpl = async (requestUrl: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    url = String(requestUrl)
+    body = String(init?.body ?? "")
+    return new Response(JSON.stringify({
+      ok: true,
+      projectId: "p1",
+      sessionId: "s1",
+      mode: "standard",
+      message: { role: "assistant", content: "answer" },
+      references: [{ title: "A", path: "wiki/a.md", kind: "wiki", snippet: "hit", score: 0.5 }],
+      toolEvents: [{ tool: "wiki.search", status: "completed", detail: "1 result" }],
+      events: [{ type: "toolEnd", tool: "wiki.search" }],
+      usage: { promptChars: 100, completionChars: 6, referenceCount: 1, toolEventCount: 1 },
+    }), { status: 200 })
+  }
+
+  const client = new LlmWikiApiClient({ baseUrl: "http://localhost:19828", fetchImpl })
+  const response = await client.chat("current", "question", {
+    sessionId: "s1",
+    mode: "standard",
+    topK: 4,
+    includeContent: true,
+    wiki: true,
+    web: false,
+    anytxt: true,
+    skills: ["reviewer"],
+  })
+
+  assert.equal(url, "http://localhost:19828/api/v1/projects/current/chat")
+  assert.deepEqual(JSON.parse(body), {
+    message: "question",
+    sessionId: "s1",
+    mode: "standard",
+    topK: 4,
+    includeContent: true,
+    tools: { wiki: true, web: false, anytxt: true },
+    skills: ["reviewer"],
+  })
+  assert.equal(response.sessionId, "s1")
+  assert.equal(response.message.content, "answer")
+  assert.equal(response.references[0]?.path, "wiki/a.md")
+  assert.equal(response.toolEvents[0]?.tool, "wiki.search")
+  assert.equal(response.events[0]?.type, "toolEnd")
+  assert.equal(response.usage?.promptChars, 100)
+})
+
+test("cancelChat posts to the chat cancellation endpoint", async () => {
+  let url = ""
+  let method = ""
+  const fetchImpl = async (requestUrl: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    url = String(requestUrl)
+    method = String(init?.method ?? "")
+    return new Response(JSON.stringify({
+      ok: true,
+      sessionId: "s1",
+      cancelled: true,
+    }), { status: 200 })
+  }
+
+  const client = new LlmWikiApiClient({ baseUrl: "http://localhost:19828", fetchImpl })
+  const response = await client.cancelChat("current", "s1")
+
+  assert.equal(url, "http://localhost:19828/api/v1/projects/current/chat/s1/cancel")
+  assert.equal(method, "POST")
+  assert.deepEqual(response, { sessionId: "s1", cancelled: true })
+})
+
 test("graph parses nodeType from API graph nodes", async () => {
   const fetchImpl = async (): Promise<Response> => (
     new Response(JSON.stringify({

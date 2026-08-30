@@ -1,32 +1,43 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown } from "lucide-react"
+import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Link, ExternalLink, Search, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useWikiStore } from "@/stores/wiki-store"
-import { listDirectory, readFile } from "@/commands/fs"
+import { listDirectory, openPathInProject, readFile } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { useTranslation } from "react-i18next"
+import { useAppDialog } from "@/stores/app-dialog-store"
 import { normalizePath } from "@/lib/path-utils"
 import { decideDeleteClick } from "@/lib/sources-tree-delete"
 import { rescanProjectFileSync } from "@/lib/project-file-sync"
-import { naturalCompare } from "@/lib/natural-sort"
+import { sortFileNodes } from "@/lib/file-tree-order"
 import {
   deleteSourceFile,
   deleteSourceFolder,
   enqueueSourceIngest,
   importSourceFiles,
   importSourceFolder,
+  type SkippedSourceImport,
+  type SourceImportResult,
 } from "@/lib/source-lifecycle"
 import { filterRawSourceTree } from "@/lib/source-filter"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { importSourceUrls, parseImportUrls, type UrlImportResult } from "@/lib/url-source-import"
+import { listIngestedSourceIdentities } from "@/lib/ingest-cache"
+import { getQueue, type IngestTask } from "@/lib/ingest-queue"
 
 const SOURCE_TREE_INITIAL_ROWS = 160
 const SOURCE_TREE_LOAD_BATCH = 160
+const IMPORT_SKIP_INITIAL_ROWS = 100
+type SourceIngestStatus = "not-ingested" | "ingested" | IngestTask["status"]
 
 export function SourcesView() {
   const { t } = useTranslation()
+  const appDialog = useAppDialog()
   const project = useWikiStore((s) => s.project)
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
@@ -39,6 +50,15 @@ export function SourcesView() {
   const [ingestingPath, setIngestingPath] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [urlDialogOpen, setUrlDialogOpen] = useState(false)
+  const [urlInput, setUrlInput] = useState("")
+  const [urlError, setUrlError] = useState<string | null>(null)
+  const [urlResults, setUrlResults] = useState<UrlImportResult[]>([])
+  const [importOutcome, setImportOutcome] = useState<ImportOutcome | null>(null)
+  const [showAllImportSkips, setShowAllImportSkips] = useState(false)
+  const [ingestedIdentities, setIngestedIdentities] = useState<string[]>([])
+  const [queueSnapshot, setQueueSnapshot] = useState<IngestTask[]>(() => [...getQueue()])
+  const [sourceQuery, setSourceQuery] = useState("")
   /**
    * Path of the source-tree node currently in "click again to
    * confirm delete" state. Lifted up here (rather than living
@@ -79,6 +99,56 @@ export function SourcesView() {
     loadSources()
   }, [loadSources, dataVersion])
 
+  useEffect(() => {
+    setSourceQuery("")
+  }, [project?.id])
+
+  useEffect(() => {
+    if (!project) {
+      setIngestedIdentities([])
+      return
+    }
+    let active = true
+    listIngestedSourceIdentities(project.path)
+      .then((identities) => {
+        if (active) setIngestedIdentities(identities)
+      })
+      .catch(() => {
+        if (active) setIngestedIdentities([])
+      })
+    return () => {
+      active = false
+    }
+  }, [project, dataVersion])
+
+  useEffect(() => {
+    const refresh = () => setQueueSnapshot([...getQueue()])
+    refresh()
+    const interval = setInterval(refresh, 1000)
+    return () => clearInterval(interval)
+  }, [project])
+
+  const sourceStatuses = useMemo(() => {
+    const statuses = new Map<string, SourceIngestStatus>()
+    if (!project) return statuses
+    const pp = normalizePath(project.path)
+    for (const identity of ingestedIdentities) {
+      statuses.set(`${pp}/raw/sources/${normalizePath(identity)}`, "ingested")
+    }
+    for (const task of queueSnapshot) {
+      if (task.projectId !== project.id || task.status === "done") continue
+      const path = normalizePath(task.sourcePath)
+      statuses.set(path.startsWith("/") || /^[A-Za-z]:\//.test(path) ? path : `${pp}/${path}`, task.status)
+    }
+    return statuses
+  }, [ingestedIdentities, project, queueSnapshot])
+  const filteredSources = useMemo(
+    () => filterSourceTreeByQuery(sources, sourceQuery),
+    [sourceQuery, sources],
+  )
+  const totalSourceCount = useMemo(() => countFiles(sources), [sources])
+  const filteredSourceCount = useMemo(() => countFiles(filteredSources), [filteredSources])
+
   async function handleRefreshSources() {
     if (!project || refreshing) return
     setRefreshing(true)
@@ -104,10 +174,11 @@ export function SourcesView() {
         {
           name: "Documents",
           extensions: [
-            "md", "mdx", "txt", "rtf", "pdf",
+            "md", "mdx", "txt", "org", "rtf", "pdf",
             "html", "htm", "xml",
-            "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-            "odt", "ods", "odp", "epub", "pages", "numbers", "key",
+            "doc", "docx", "docm", "xls", "xlsx", "xlsm", "xlsb",
+            "ppt", "pps", "pot", "pptx", "pptm", "ppsx", "ppsm",
+            "odt", "ods", "odp", "epub", "mobi", "pages", "numbers", "key",
           ],
         },
         {
@@ -136,10 +207,16 @@ export function SourcesView() {
     if (!selected || selected.length === 0) return
 
     setImporting(true)
+    setImportOutcome(null)
+    setShowAllImportSkips(false)
     const paths = Array.isArray(selected) ? selected : [selected]
     try {
-      await importSourceFiles(project, paths, llmConfig, sourceWatchConfig)
+      const result = await importSourceFiles(project, paths, llmConfig, sourceWatchConfig)
+      setImportOutcome(summarizeImportOutcome(result, null))
       await loadSources()
+    } catch (err) {
+      console.error("Failed to import files:", err)
+      setImportOutcome(summarizeImportOutcome(null, err))
     } finally {
       setImporting(false)
     }
@@ -156,11 +233,38 @@ export function SourcesView() {
     if (!selected || typeof selected !== "string") return
 
     setImporting(true)
+    setImportOutcome(null)
+    setShowAllImportSkips(false)
     try {
-      await importSourceFolder(project, selected, llmConfig, sourceWatchConfig)
+      const result = await importSourceFolder(project, selected, llmConfig, sourceWatchConfig)
+      setImportOutcome(summarizeImportOutcome(result, null))
       await loadSources()
     } catch (err) {
       console.error(`Failed to import folder:`, err)
+      setImportOutcome(summarizeImportOutcome(null, err))
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  async function handleImportUrls() {
+    if (!project || importing) return
+    let urls: string[]
+    try {
+      urls = parseImportUrls(urlInput)
+      if (urls.length === 0) throw new Error(t("sources.urlImport.empty"))
+    } catch (error) {
+      setUrlError(error instanceof Error ? error.message : String(error))
+      return
+    }
+    setImporting(true)
+    setUrlError(null)
+    setUrlResults([])
+    try {
+      const results = await importSourceUrls(project, urls, llmConfig, sourceWatchConfig)
+      setUrlResults(results)
+      await loadSources()
+      if (results.every((result) => result.path && !result.error)) setUrlInput("")
     } finally {
       setImporting(false)
     }
@@ -172,6 +276,19 @@ export function SourcesView() {
       openFileInPreview(node.path, content)
     } catch (err) {
       console.error("Failed to read source:", err)
+    }
+  }
+
+  async function handleOpenSourceExternally(node: FileNode) {
+    if (!project) return
+    try {
+      await openPathInProject(project.path, node.path)
+    } catch (err) {
+      console.error("Failed to open source externally:", err)
+      await appDialog.alert({ message: t("sources.openExternalFailed", {
+        name: node.name,
+        error: String(err),
+      }) })
     }
   }
 
@@ -199,7 +316,7 @@ export function SourcesView() {
       }
     } catch (err) {
       console.error("Failed to delete source:", err)
-      window.alert(`Failed to delete: ${err}`)
+      await appDialog.alert({ message: `Failed to delete: ${err}` })
     }
   }
 
@@ -235,7 +352,7 @@ export function SourcesView() {
       }
     } catch (err) {
       console.error("Failed to delete folder:", err)
-      window.alert(`Failed to delete folder: ${err}`)
+      await appDialog.alert({ message: `Failed to delete folder: ${err}` })
     }
   }
 
@@ -290,8 +407,78 @@ export function SourcesView() {
             <Plus className="mr-1 h-4 w-4" />
             {t("sources.importFolder", "Folder")}
           </Button>
+          <Button size="sm" onClick={() => setUrlDialogOpen(true)} disabled={importing}>
+            <Link className="mr-1 h-4 w-4" />
+            {t("sources.importUrls")}
+          </Button>
         </div>
       </div>
+
+      <Dialog open={urlDialogOpen} onOpenChange={setUrlDialogOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("sources.urlImport.title")}</DialogTitle>
+            <DialogDescription>{t("sources.urlImport.description")}</DialogDescription>
+          </DialogHeader>
+          <textarea
+            className="min-h-44 w-full resize-y rounded-md border bg-background px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            value={urlInput}
+            onChange={(event) => {
+              setUrlInput(event.target.value)
+              setUrlError(null)
+              setUrlResults([])
+            }}
+            placeholder={t("sources.urlImport.placeholder")}
+            disabled={importing}
+          />
+          {urlError && <p className="text-sm text-destructive">{urlError}</p>}
+          {urlResults.length > 0 && (
+            <div className="max-h-40 space-y-1 overflow-auto rounded-md border p-2 text-xs">
+              {urlResults.map((result) => (
+                <div key={result.url} className={result.error ? "text-destructive" : "text-muted-foreground"}>
+                  <span className="break-all">{result.url}</span>
+                  <span className="ml-2">{result.error ?? t("sources.urlImport.imported")}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setUrlDialogOpen(false)} disabled={importing}>
+              {t("common.close")}
+            </Button>
+            <Button onClick={() => void handleImportUrls()} disabled={importing || !urlInput.trim()}>
+              {importing ? t("sources.importing") : t("sources.urlImport.submit")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {sources.length > 0 && (
+        <div className="border-b px-4 py-2.5">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={sourceQuery}
+              onChange={(event) => setSourceQuery(event.target.value)}
+              placeholder={t("sources.searchPlaceholder")}
+              aria-label={t("sources.searchPlaceholder")}
+              className="h-8 pl-8 pr-8"
+            />
+            {sourceQuery && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="absolute right-0.5 top-1/2 h-7 w-7 -translate-y-1/2"
+                onClick={() => setSourceQuery("")}
+                aria-label={t("sources.clearSearch")}
+              >
+                <X className="h-3.5 w-3.5" />
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
 
       <ScrollArea className="min-h-0 flex-1 overflow-hidden">
         {refreshError && (
@@ -300,6 +487,57 @@ export function SourcesView() {
               defaultValue: "Failed to refresh sources: {{error}}",
               error: refreshError,
             })}
+          </div>
+        )}
+        {importOutcome && (
+          <div className="mx-4 mt-3 space-y-1 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            <div className="flex items-start justify-between gap-2">
+              <span className="font-medium">
+                {importOutcome.error
+                  ? t("sources.importSkip.failed", {
+                      defaultValue: "Import failed: {{error}}",
+                      error: importOutcome.error,
+                    })
+                  : t("sources.importSkip.summary", {
+                      defaultValue: "Imported {{imported}}, skipped {{skipped}}",
+                      imported: importOutcome.importedCount,
+                      skipped: importOutcome.skipped.length,
+                    })}
+              </span>
+              <button
+                type="button"
+                onClick={() => setImportOutcome(null)}
+                className="shrink-0 rounded p-0.5 hover:bg-destructive/20"
+                aria-label={t("common.dismiss", { defaultValue: "Dismiss" })}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+            {importOutcome.skipped
+              .slice(0, showAllImportSkips ? undefined : IMPORT_SKIP_INITIAL_ROWS)
+              .map((item, index) => (
+                <div key={`${item.name}-${index}`} className="pl-1">
+                  {item.name}
+                  {": "}
+                  {t(`sources.importSkip.reason.${item.reason}`, {
+                    defaultValue: item.reason,
+                  })}
+                  {item.detail ? ` (${item.detail})` : ""}
+                </div>
+              ))}
+            {importOutcome.skipped.length > IMPORT_SKIP_INITIAL_ROWS && (
+              <button
+                type="button"
+                className="pl-1 font-medium underline underline-offset-2"
+                onClick={() => setShowAllImportSkips((current) => !current)}
+              >
+                {showAllImportSkips
+                  ? t("sources.importSkip.showLess")
+                  : t("sources.importSkip.showRemaining", {
+                      count: importOutcome.skipped.length - IMPORT_SKIP_INITIAL_ROWS,
+                    })}
+              </button>
+            )}
           </div>
         )}
         {sources.length === 0 ? (
@@ -317,24 +555,38 @@ export function SourcesView() {
               </Button>
             </div>
           </div>
+        ) : filteredSources.length === 0 ? (
+          <div className="flex h-32 items-center justify-center px-6 text-center text-sm text-muted-foreground">
+            {t("sources.noSearchResults", { query: sourceQuery.trim() })}
+          </div>
         ) : (
           <div className="p-2">
             <SourceTree
-              nodes={sources}
+              nodes={filteredSources}
               onOpen={handleOpenSource}
+              onOpenExternal={handleOpenSourceExternally}
               onIngest={handleIngest}
               onDelete={handleDelete}
               onDeleteFolder={handleDeleteFolder}
               pendingDeletePath={pendingDeletePath}
               setPendingDeletePath={setPendingDeletePath}
               ingestingPath={ingestingPath}
+              sourceStatuses={sourceStatuses}
+              forceExpanded={Boolean(sourceQuery.trim())}
             />
           </div>
         )}
       </ScrollArea>
 
       <div className="flex items-center justify-between gap-2 border-t px-4 py-2 text-xs text-muted-foreground">
-        <span>{t("sources.sourceCount", { count: countFiles(sources) })}</span>
+        <span>
+          {sourceQuery.trim()
+            ? t("sources.filteredSourceCount", {
+                count: filteredSourceCount,
+                total: totalSourceCount,
+              })
+            : t("sources.sourceCount", { count: totalSourceCount })}
+        </span>
         <Tooltip>
           <TooltipTrigger
             render={
@@ -377,12 +629,55 @@ function countFiles(nodes: FileNode[]): number {
   return count
 }
 
+export interface ImportOutcome {
+  importedCount: number
+  skipped: SkippedSourceImport[]
+  error: string | null
+}
+
+/**
+ * Decides whether an import needs to say anything to the user.
+ * A clean import stays quiet; anything skipped or thrown gets reported.
+ */
+export function summarizeImportOutcome(
+  result: SourceImportResult | null,
+  error: unknown,
+): ImportOutcome | null {
+  if (error) {
+    return {
+      importedCount: result?.imported.length ?? 0,
+      skipped: result?.skipped ?? [],
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+  if (!result || result.skipped.length === 0) return null
+  return { importedCount: result.imported.length, skipped: result.skipped, error: null }
+}
+
+export function filterSourceTreeByQuery(
+  nodes: readonly FileNode[],
+  query: string,
+): FileNode[] {
+  const needle = query.trim().normalize("NFKC").toLocaleLowerCase()
+  if (!needle) return [...nodes]
+
+  const visit = (node: FileNode): FileNode | null => {
+    const haystack = `${node.name}\n${normalizePath(node.path)}`
+      .normalize("NFKC")
+      .toLocaleLowerCase()
+    if (haystack.includes(needle)) return node
+    if (!node.is_dir || !node.children) return null
+    const children = node.children
+      .map(visit)
+      .filter((child): child is FileNode => child !== null)
+    return children.length > 0 ? { ...node, children } : null
+  }
+
+  return nodes.map(visit).filter((node): node is FileNode => node !== null)
+}
+
 function sortSourceNodes(nodes: readonly FileNode[]): FileNode[] {
-  return [...nodes].sort((a, b) => {
-    if (a.is_dir && !b.is_dir) return -1
-    if (!a.is_dir && b.is_dir) return 1
-    return naturalCompare(a.name, b.name)
-  })
+  return sortFileNodes(nodes)
 }
 
 function flattenVisibleRows(
@@ -403,15 +698,19 @@ function flattenVisibleRows(
 function SourceTree({
   nodes,
   onOpen,
+  onOpenExternal,
   onIngest,
   onDelete,
   onDeleteFolder,
   pendingDeletePath,
   setPendingDeletePath,
   ingestingPath,
+  sourceStatuses,
+  forceExpanded,
 }: {
   nodes: FileNode[]
   onOpen: (node: FileNode) => void
+  onOpenExternal: (node: FileNode) => void
   onIngest: (node: FileNode) => void
   onDelete: (node: FileNode) => void
   onDeleteFolder: (node: FileNode) => void
@@ -422,12 +721,17 @@ function SourceTree({
   pendingDeletePath: string | null
   setPendingDeletePath: (path: string | null) => void
   ingestingPath: string | null
+  sourceStatuses: ReadonlyMap<string, SourceIngestStatus>
+  forceExpanded: boolean
 }) {
   const { t } = useTranslation()
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   const [visibleLimit, setVisibleLimit] = useState(SOURCE_TREE_INITIAL_ROWS)
   const loadMoreRef = useRef<HTMLDivElement | null>(null)
-  const rows = useMemo(() => flattenVisibleRows(nodes, collapsed), [nodes, collapsed])
+  const rows = useMemo(
+    () => flattenVisibleRows(nodes, forceExpanded ? {} : collapsed),
+    [collapsed, forceExpanded, nodes],
+  )
   const visibleRows = rows.slice(0, visibleLimit)
   const hasMore = visibleLimit < rows.length
 
@@ -480,8 +784,9 @@ function SourceTree({
     <>
       {visibleRows.map(({ node, depth }) => {
         const isPendingDelete = pendingDeletePath === node.path
+        const ingestStatus = sourceStatuses.get(normalizePath(node.path)) ?? "not-ingested"
         if (node.is_dir && node.children) {
-          const isCollapsed = collapsed[node.path] ?? false
+          const isCollapsed = !forceExpanded && (collapsed[node.path] ?? false)
           return (
             <div key={node.path}>
               <div
@@ -489,7 +794,9 @@ function SourceTree({
                 style={{ paddingLeft: `${depth * 16 + 4}px` }}
               >
                 <button
-                  onClick={() => toggle(node.path)}
+                  onClick={() => {
+                    if (!forceExpanded) toggle(node.path)
+                  }}
                   className="flex flex-1 items-center gap-1.5 px-1 py-1 text-left"
                 >
                   {isCollapsed ? (
@@ -529,13 +836,38 @@ function SourceTree({
             >
               <FileText className="h-4 w-4 shrink-0" />
               <span className="truncate">{node.name}</span>
+              <span
+                className={
+                  ingestStatus === "failed"
+                    ? "shrink-0 text-[10px] text-destructive"
+                    : ingestStatus === "processing"
+                      ? "shrink-0 text-[10px] text-primary"
+                      : "shrink-0 text-[10px] text-muted-foreground"
+                }
+              >
+                {t(`sources.ingestStatus.${ingestStatus}`)}
+              </span>
             </button>
             <Button
               variant="ghost"
               size="icon"
               className="h-7 w-7 shrink-0"
+              title={t("sources.openExternal")}
+              aria-label={t("sources.openExternal")}
+              onClick={() => onOpenExternal(node)}
+            >
+              <ExternalLink className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 shrink-0"
               title={t("sources.ingest")}
-              disabled={ingestingPath === node.path}
+              disabled={
+                ingestingPath === node.path ||
+                ingestStatus === "pending" ||
+                ingestStatus === "processing"
+              }
               onClick={() => onIngest(node)}
             >
               <BookOpen className="h-4 w-4" />

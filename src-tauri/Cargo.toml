@@ -1,9 +1,13 @@
 [package]
 name = "llm-wiki"
-version = "0.5.4"
+version = "0.6.11"
 description = "LLM Wiki - A personal knowledge base for LLM concepts"
 authors = []
 edition = "2021"
+# AnyDoc and its archive/spreadsheet dependencies require Rust 1.88. Declaring
+# the floor here gives contributors an immediate toolchain error instead of a
+# late, platform-dependent dependency compilation failure.
+rust-version = "1.88"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -29,12 +33,13 @@ tauri-plugin-dialog = "2.7.1"
 pdfium-render = "0.9"
 tauri-plugin-store = "2.4.2"
 tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tiny_http = "0.12"
 zip = "2"
 calamine = "0.34.0"
 docx-rs = "0.4.20"
 office_oxide = "=0.1.2"
+anydoc = "0.1.6"
 lancedb = "0.27.2"
 # tokio provided by tauri runtime for async commands
 arrow-array = "57"
@@ -43,7 +48,7 @@ futures = "0.3"
 # Claude Code CLI subprocess transport: spawn `claude` as a child process,
 # stream stdout line-by-line back to the frontend. tokio::process gives us
 # async io and clean cancellation; `which` locates the binary on PATH.
-tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt"] }
+tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "time"] }
 which = "7"
 uuid = { version = "1", features = ["v4"] }
 # Multimodal image extraction (Phase 1):
@@ -62,6 +67,9 @@ sha2 = "0.10"
 md-5 = "0.10"
 notify = "8"
 walkdir = "2"
+epub = "2.1.5"
+mobi = "0.8"
+html2text = { version = "0.17.1", default-features = false, features = ["xml"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

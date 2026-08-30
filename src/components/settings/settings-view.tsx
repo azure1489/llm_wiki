@@ -29,6 +29,7 @@ import { loadSourceWatchConfig, saveLanguage, saveTheme, loadTheme } from "@/lib
 import { applyTheme, type AppTheme } from "@/lib/theme"
 import type { SettingsDraft, DraftSetter } from "./settings-types"
 import { normalizeSourceWatchConfig } from "@/lib/source-watch-config"
+import { setIngestWorkerLimit } from "@/lib/ingest-queue"
 import { LlmProviderSection } from "./sections/llm-provider-section"
 import { EmbeddingSection } from "./sections/embedding-section"
 import { MultimodalSection } from "./sections/multimodal-section"
@@ -128,6 +129,7 @@ function initialDraft(
     maxContextSize: llm.maxContextSize ?? 204800,
     apiMode: llm.apiMode,
     reasoning: llm.reasoning,
+    ingestReasoning: llm.ingestReasoning,
     localCliIsolation: llm.localCliIsolation === true,
     embeddingEnabled: embed.enabled,
     embeddingEndpoint: embed.endpoint,
@@ -136,6 +138,8 @@ function initialDraft(
     embeddingOutputDimensionality: embed.outputDimensionality,
     embeddingMaxChunkChars: embed.maxChunkChars,
     embeddingOverlapChunkChars: embed.overlapChunkChars,
+    embeddingConcurrency: embed.concurrency ?? 1,
+    embeddingBatchSize: embed.batchSize ?? 1,
     embeddingExtraHeaders: embed.extraHeaders ?? {},
     multimodalEnabled: multimodal.enabled,
     multimodalUseMainLlm: multimodal.useMainLlm,
@@ -153,11 +157,24 @@ function initialDraft(
     proxyEnabled: proxy.enabled,
     proxyUrl: proxy.url,
     proxyBypassLocal: proxy.bypassLocal,
+    proxyAcceptInvalidCerts: proxy.acceptInvalidCerts === true,
     scheduledImportEnabled: scheduledImport.enabled,
     scheduledImportPath: displayPath,
     scheduledImportInterval: scheduledImport.interval,
     sourceWatchConfig: normalizeSourceWatchConfig(sourceWatch),
     mineruEnabled: mineru.enabled,
+    mineruBackend: mineru.backend || "cloud",
+    mineruLocalEndpoint:
+      mineru.localEndpoint || "http://127.0.0.1:8000",
+    mineruLocalToken: mineru.localToken || "",
+    mineruLocalBackend: mineru.localBackend || "hybrid-engine",
+    mineruLocalEffort: mineru.localEffort || "medium",
+    mineruLocalParseMethod: mineru.localParseMethod || "auto",
+    mineruLocalLanguage: mineru.localLanguage || "ch",
+    mineruLocalFormulaEnabled: mineru.localFormulaEnabled !== false,
+    mineruLocalTableEnabled: mineru.localTableEnabled !== false,
+    mineruLocalImageAnalysis: mineru.localImageAnalysis !== false,
+    mineruLocalServerUrl: mineru.localServerUrl || "",
     mineruToken: mineru.token,
     mineruModelVersion: mineru.modelVersion,
     apiEnabled: apiConfig.enabled,
@@ -246,11 +263,13 @@ export function SettingsView() {
       if (cancelled) return
       const normalized = normalizeSourceWatchConfig(config)
       setSourceWatchConfig(normalized)
+      setIngestWorkerLimit(normalized.ingestConcurrency)
       setDraftState((prev) => ({ ...prev, sourceWatchConfig: normalized }))
     }).catch(() => {
       if (cancelled) return
       const fallback = normalizeSourceWatchConfig()
       setSourceWatchConfig(fallback)
+      setIngestWorkerLimit(fallback.ingestConcurrency)
       setDraftState((prev) => ({ ...prev, sourceWatchConfig: fallback }))
     })
     return () => {
@@ -349,6 +368,7 @@ export function SettingsView() {
       maxContextSize: draft.maxContextSize,
       apiMode: draft.provider === "custom" ? draft.apiMode : undefined,
       reasoning: draft.reasoning,
+      ingestReasoning: draft.ingestReasoning,
       localCliIsolation: draft.localCliIsolation,
     }
     const newEmbed = {
@@ -359,6 +379,8 @@ export function SettingsView() {
       outputDimensionality: draft.embeddingOutputDimensionality,
       maxChunkChars: draft.embeddingMaxChunkChars,
       overlapChunkChars: draft.embeddingOverlapChunkChars,
+      concurrency: Math.max(1, Math.min(32, Math.floor(draft.embeddingConcurrency || 1))),
+      batchSize: Math.max(1, Math.min(64, Math.floor(draft.embeddingBatchSize || 1))),
       extraHeaders: draft.embeddingExtraHeaders,
     }
     const newMultimodal = {
@@ -385,6 +407,7 @@ export function SettingsView() {
       enabled: draft.proxyEnabled,
       url: draft.proxyUrl.trim(),
       bypassLocal: draft.proxyBypassLocal,
+      acceptInvalidCerts: draft.proxyAcceptInvalidCerts,
     }
     const newSourceWatch = normalizeSourceWatchConfig(draft.sourceWatchConfig)
     const newScheduledImport = {
@@ -395,6 +418,17 @@ export function SettingsView() {
     }
     const newMineruConfig = {
       enabled: draft.mineruEnabled,
+      backend: draft.mineruBackend,
+      localEndpoint: draft.mineruLocalEndpoint.trim(),
+      localToken: draft.mineruLocalToken.trim(),
+      localBackend: draft.mineruLocalBackend,
+      localEffort: draft.mineruLocalEffort,
+      localParseMethod: draft.mineruLocalParseMethod,
+      localLanguage: draft.mineruLocalLanguage.trim(),
+      localFormulaEnabled: draft.mineruLocalFormulaEnabled,
+      localTableEnabled: draft.mineruLocalTableEnabled,
+      localImageAnalysis: draft.mineruLocalImageAnalysis,
+      localServerUrl: draft.mineruLocalServerUrl.trim(),
       token: draft.mineruToken.trim(),
       modelVersion: draft.mineruModelVersion,
     }
@@ -420,6 +454,7 @@ export function SettingsView() {
     setOutputLanguage(draft.outputLanguage as typeof outputLanguage)
     setProxyConfig(newProxy)
     setSourceWatchConfig(newSourceWatch)
+    setIngestWorkerLimit(newSourceWatch.ingestConcurrency)
     setScheduledImportConfig(newScheduledImport)
     setMaxHistoryMessages(draft.maxHistoryMessages)
     setMineruConfig(newMineruConfig)
@@ -455,16 +490,10 @@ export function SettingsView() {
 
       if (project) {
         await saveScheduledImportConfig(project.path, newScheduledImport)
-        const { startScheduledImport, stopScheduledImport } = await import("@/lib/scheduled-import")
-        if (
-          newScheduledImport.enabled &&
-          newScheduledImport.path &&
-          newScheduledImport.interval > 0
-        ) {
-          startScheduledImport(project, newScheduledImport)
-        } else {
-          stopScheduledImport()
-        }
+        const { startScheduledImport } = await import("@/lib/scheduled-import")
+        // Keep the cross-project scheduler alive even if the current
+        // project's own monitor was just disabled.
+        startScheduledImport(project, newScheduledImport)
       }
 
       await saveMineruConfig(newMineruConfig)

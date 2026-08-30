@@ -6,13 +6,13 @@ import rehypeKatex from "rehype-katex"
 import "katex/dist/katex.min.css"
 import {
   Search, Loader2, CheckCircle2, AlertCircle, ChevronRight, ChevronDown, X,
-  FileSearch, FileText, Globe2, Send,
+  FileSearch, FileText, Globe2, Send, RotateCcw,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { useResearchStore, type ResearchTask } from "@/stores/research-store"
+import { hasActiveResearchRerun, useResearchStore, type ResearchTask } from "@/stores/research-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { readFile } from "@/commands/fs"
-import { queueResearch } from "@/lib/deep-research"
+import { queueResearch, queueResearchBatch } from "@/lib/deep-research"
 import { normalizePath } from "@/lib/path-utils"
 import { hasConfiguredDeepResearchSources } from "@/lib/web-search"
 import { isImeComposing } from "@/lib/keyboard-utils"
@@ -20,9 +20,11 @@ import { detectLanguage } from "@/lib/detect-language"
 import { getHtmlLang, getTextDirection } from "@/lib/language-metadata"
 import { MermaidDiagram, unwrapMermaidPre } from "@/components/mermaid-diagram"
 import { useTranslation } from "react-i18next"
+import { useAppDialog } from "@/stores/app-dialog-store"
 
 export function ResearchPanel() {
   const { t } = useTranslation()
+  const appDialog = useAppDialog()
   const tasks = useResearchStore((s) => s.tasks)
   const removeTask = useResearchStore((s) => s.removeTask)
   const setPanelOpen = useResearchStore((s) => s.setPanelOpen)
@@ -35,15 +37,35 @@ export function ResearchPanel() {
   const queued = tasks.filter((t) => t.status === "queued")
   const done = tasks.filter((t) => t.status === "done" || t.status === "error")
 
-  function handleStartResearch() {
+  async function handleStartResearch() {
     const topic = inputValue.trim()
     if (!topic || !project) return
     if (!hasConfiguredDeepResearchSources(searchApiConfig)) {
-      window.alert(t("research.notConfigured"))
+      await appDialog.alert({ message: t("research.notConfigured") })
       return
     }
     queueResearch(normalizePath(project.path), topic, llmConfig, searchApiConfig)
     setInputValue("")
+  }
+
+  async function handleRetryResearch(task: ResearchTask) {
+    if (!project) return
+    if (hasActiveResearchRerun(useResearchStore.getState().tasks, task.id)) return
+    if (!hasConfiguredDeepResearchSources(searchApiConfig)) {
+      await appDialog.alert({ message: t("research.notConfigured") })
+      return
+    }
+    queueResearchBatch(
+      normalizePath(project.path),
+      [{
+        topic: task.topic,
+        searchQueries: task.searchQueries,
+        sourceReviewId: task.sourceReviewId,
+        rerunOfTaskId: task.id,
+      }],
+      llmConfig,
+      searchApiConfig,
+    )
   }
 
   return (
@@ -94,13 +116,19 @@ export function ResearchPanel() {
         ) : (
           <div className="flex flex-col gap-1 p-2">
             {running.map((task) => (
-              <ResearchTaskCard key={task.id} task={task} onRemove={removeTask} />
+              <ResearchTaskCard
+                key={task.id}
+                task={task}
+                onRemove={removeTask}
+                onRetry={handleRetryResearch}
+                rerunPending={hasActiveResearchRerun(tasks, task.id)}
+              />
             ))}
             {queued.map((task) => (
-              <ResearchTaskCard key={task.id} task={task} onRemove={removeTask} />
+              <ResearchTaskCard key={task.id} task={task} onRemove={removeTask} onRetry={handleRetryResearch} rerunPending={hasActiveResearchRerun(tasks, task.id)} />
             ))}
             {done.map((task) => (
-              <ResearchTaskCard key={task.id} task={task} onRemove={removeTask} />
+              <ResearchTaskCard key={task.id} task={task} onRemove={removeTask} onRetry={handleRetryResearch} rerunPending={hasActiveResearchRerun(tasks, task.id)} />
             ))}
           </div>
         )}
@@ -123,6 +151,7 @@ function separateThinking(text: string): { thinking: string; answer: string } {
 }
 
 function SynthesisBlock({ synthesis, isStreaming }: { synthesis: string; isStreaming: boolean }) {
+  const { t } = useTranslation()
   const scrollRef = useRef<HTMLDivElement>(null)
   const { thinking, answer } = useMemo(() => separateThinking(synthesis), [synthesis])
   const renderLanguage = useMemo(() => detectLanguage(answer || synthesis), [answer, synthesis])
@@ -146,7 +175,7 @@ function SynthesisBlock({ synthesis, isStreaming }: { synthesis: string; isStrea
 
   return (
     <div className="mb-2 flex flex-col min-h-0">
-      <div className="mb-1 font-medium text-muted-foreground">Synthesis</div>
+      <div className="mb-1 font-medium text-muted-foreground">{t("research.synthesis")}</div>
       <div
         ref={scrollRef}
         className="flex-1 overflow-y-auto rounded bg-muted/30 p-2 prose prose-xs prose-invert max-w-none"
@@ -165,7 +194,7 @@ function SynthesisBlock({ synthesis, isStreaming }: { synthesis: string; isStrea
               ) : (
                 <ChevronDown className="h-3 w-3" />
               )}
-              Thinking{isStreaming && !answer ? "..." : ""}
+              {t("research.thinking")}{isStreaming && !answer ? "..." : ""}
             </button>
             {!thinkingCollapsed && (
               <div className="mt-1 rounded border border-muted px-2 py-1 text-[10px] text-muted-foreground opacity-70 leading-relaxed whitespace-pre-wrap">
@@ -217,7 +246,17 @@ function SynthesisBlock({ synthesis, isStreaming }: { synthesis: string; isStrea
   )
 }
 
-function ResearchTaskCard({ task, onRemove }: { task: ResearchTask; onRemove: (id: string) => void }) {
+function ResearchTaskCard({
+  task,
+  onRemove,
+  onRetry,
+  rerunPending,
+}: {
+  task: ResearchTask
+  onRemove: (id: string) => void
+  onRetry: (task: ResearchTask) => void
+  rerunPending: boolean
+}) {
   const { t } = useTranslation()
   const [expanded, setExpanded] = useState(
     task.status === "synthesizing" || task.status === "searching"
@@ -318,6 +357,18 @@ function ResearchTaskCard({ task, onRemove }: { task: ResearchTask; onRemove: (i
               <Button variant="outline" size="sm" className="h-6 text-[11px] gap-1" onClick={handleOpenSaved}>
                 <FileText className="h-3 w-3" />
                 {t("research.open")}
+              </Button>
+            )}
+            {(task.status === "done" || task.status === "error") && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 text-[11px] gap-1"
+                onClick={() => onRetry(task)}
+                disabled={rerunPending}
+              >
+                <RotateCcw className="h-3 w-3" />
+                {t(task.status === "error" ? "research.retry" : "research.rerun")}
               </Button>
             )}
             {(task.status === "done" || task.status === "error") && (

@@ -9,20 +9,24 @@ import { useLintStore } from "@/stores/lint-store"
 import { useChatStore } from "@/stores/chat-store"
 import { BASE_FONT_SIZE_PX, useZoomStore } from "@/stores/zoom-store"
 import { openProject } from "@/commands/fs"
-import { getLastProject, getRecentProjects, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig, loadEmbeddingConfig, loadMineruConfig, loadMultimodalConfig, loadOutputLanguage, loadProviderConfigs, loadActivePresetId, loadProxyConfig, loadScheduledImportConfig, saveScheduledImportConfig, loadSourceWatchConfig, loadApiConfig, loadGeneralConfig, loadZoomLevel } from "@/lib/project-store"
+import { getLastProject, getRecentProjects, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig, loadEmbeddingConfig, loadMineruConfig, loadMultimodalConfig, loadOutputLanguage, loadProviderConfigs, loadCustomLlmPresets, loadActivePresetId, loadTaskModelRouting, loadProjectLlmOverride, loadProxyConfig, loadScheduledImportConfig, saveScheduledImportConfig, loadSourceWatchConfig, loadApiConfig, loadGeneralConfig, loadZoomLevel } from "@/lib/project-store"
 import { loadReviewItems, loadLintItems, loadChatHistory, loadChatPreferences } from "@/lib/persist"
 import { setupAutoSave } from "@/lib/auto-save"
 import { startClipWatcher } from "@/lib/clip-watcher"
+import { DEFAULT_SOURCE_WATCH_CONFIG } from "@/lib/source-watch-config"
+import { useGlobalShortcut } from "@/hooks/use-global-shortcut"
 import { AppLayout } from "@/components/layout/app-layout"
 import { WelcomeScreen } from "@/components/project/welcome-screen"
 import { CreateProjectDialog } from "@/components/project/create-project-dialog"
 import type { WikiProject } from "@/types/wiki"
+import { useAppDialog } from "@/stores/app-dialog-store"
 
 function applyDocumentZoom(level: number) {
   document.documentElement.style.fontSize = `${BASE_FONT_SIZE_PX * level}px`
 }
 
 function App() {
+  const appDialog = useAppDialog()
   const project = useWikiStore((s) => s.project)
   const setProject = useWikiStore((s) => s.setProject)
   const setFileTree = useWikiStore((s) => s.setFileTree)
@@ -35,6 +39,40 @@ function App() {
   function isCurrentProject(proj: WikiProject): boolean {
     const current = useWikiStore.getState().project
     return current?.id === proj.id && current.path === proj.path
+  }
+
+  async function hydrateProjectChatStore(proj: WikiProject): Promise<void> {
+    try {
+      const activeBeforeLoad = useChatStore.getState().activeConversationId
+      const savedChat = await loadChatHistory(proj.path)
+      if (!isCurrentProject(proj)) return
+      const stateAfterLoad = useChatStore.getState()
+      const activeChangedDuringLoad = stateAfterLoad.activeConversationId !== activeBeforeLoad
+      if (savedChat.conversations.length > 0) {
+        const existingConversations = activeChangedDuringLoad ? stateAfterLoad.conversations : []
+        const existingMessages = activeChangedDuringLoad ? stateAfterLoad.messages : []
+        const mergedConversations = [
+          ...existingConversations,
+          ...savedChat.conversations.filter(
+            (conversation) => !existingConversations.some((existing) => existing.id === conversation.id)
+          ),
+        ]
+        const mergedMessages = [
+          ...existingMessages,
+          ...savedChat.messages.filter(
+            (message) => !existingMessages.some((existing) => existing.id === message.id)
+          ),
+        ]
+        useChatStore.getState().setConversations(mergedConversations)
+        useChatStore.getState().setMessages(mergedMessages)
+        const sorted = [...savedChat.conversations].sort((a, b) => b.updatedAt - a.updatedAt)
+        if (!activeChangedDuringLoad && sorted[0]) {
+          useChatStore.getState().setActiveConversation(sorted[0].id)
+        }
+      }
+    } catch (err) {
+      console.warn("[startup] failed to load chat history:", err)
+    }
   }
 
   async function hydrateProjectSideStores(proj: WikiProject): Promise<void> {
@@ -55,26 +93,18 @@ function App() {
     } catch (err) {
       console.warn("[startup] failed to load lint items:", err)
     }
-
-    try {
-      const savedChat = await loadChatHistory(proj.path)
-      if (!isCurrentProject(proj)) return
-      if (savedChat.conversations.length > 0) {
-        useChatStore.getState().setConversations(savedChat.conversations)
-        useChatStore.getState().setMessages(savedChat.messages)
-        const sorted = [...savedChat.conversations].sort((a, b) => b.updatedAt - a.updatedAt)
-        if (sorted[0]) {
-          useChatStore.getState().setActiveConversation(sorted[0].id)
-        }
-      }
-    } catch (err) {
-      console.warn("[startup] failed to load chat history:", err)
-    }
   }
 
   async function hydrateScheduledImportAfterOpen(proj: WikiProject): Promise<void> {
     try {
-      const savedScheduledImport = await loadScheduledImportConfig(proj.path)
+      let savedScheduledImport = null
+      try {
+        savedScheduledImport = await loadScheduledImportConfig(proj.path)
+      } catch (err) {
+        // A damaged config for the active project must not disable monitors
+        // belonging to every other recent project.
+        console.warn("[startup] failed to load current scheduled import config:", err)
+      }
       if (!isCurrentProject(proj)) return
       if (savedScheduledImport) {
         // Migrate relative path to absolute (backward compatibility)
@@ -86,15 +116,22 @@ function App() {
           ...savedScheduledImport,
           path,
         })
+      } else {
+        useWikiStore.getState().setScheduledImportConfig({
+          enabled: false,
+          path: "",
+          interval: 60,
+          lastScan: null,
+        })
       }
 
       const scheduledImportConfig = useWikiStore.getState().scheduledImportConfig
       if (!isCurrentProject(proj)) return
-      if (scheduledImportConfig.enabled && scheduledImportConfig.path && scheduledImportConfig.interval > 0) {
-        const { startScheduledImport } = await import("@/lib/scheduled-import")
-        if (!isCurrentProject(proj)) return
-        startScheduledImport(proj, scheduledImportConfig)
-      }
+      const { startScheduledImport } = await import("@/lib/scheduled-import")
+      if (!isCurrentProject(proj)) return
+      // Start the global sweep even when this project's own schedule is off;
+      // recently opened projects may still have active folder monitors.
+      startScheduledImport(proj, scheduledImportConfig)
     } catch (err) {
       console.warn("[startup] failed to hydrate scheduled import:", err)
     }
@@ -105,6 +142,15 @@ function App() {
     setupAutoSave()
     startClipWatcher()
   }, [])
+
+  // Register global keyboard shortcuts
+  // Cmd+, on macOS or Ctrl+, on Windows/Linux opens settings
+  useGlobalShortcut({
+    ",": {
+      callback: () => setActiveView("settings"),
+      allowInTextInput: true,
+    },
+  })
 
   useEffect(() => {
     // Apply interface zoom globally, including welcome/settings screens. We
@@ -267,11 +313,14 @@ function App() {
         const savedConfig = await loadLlmConfig()
         if (savedConfig) {
           useWikiStore.getState().setLlmConfig(savedConfig)
+          useWikiStore.getState().setGlobalLlmConfig(savedConfig)
         }
         const savedProviderConfigs = await loadProviderConfigs()
         if (savedProviderConfigs) {
           useWikiStore.getState().setProviderConfigs(savedProviderConfigs)
         }
+        const savedCustomLlmPresets = await loadCustomLlmPresets()
+        useWikiStore.getState().setCustomLlmPresets(savedCustomLlmPresets)
         const savedActivePreset = await loadActivePresetId()
         if (savedActivePreset) {
           useWikiStore.getState().setActivePresetId(savedActivePreset)
@@ -282,17 +331,22 @@ function App() {
           // `llmConfig` snapshot from a previous launch would keep the
           // old value. Overrides still win, so an explicit user choice
           // is preserved.
-          const { LLM_PRESETS } = await import("@/components/settings/llm-presets")
+          const { findLlmPreset } = await import("@/components/settings/llm-presets")
           const { resolveConfig } = await import("@/components/settings/preset-resolver")
-          const preset = LLM_PRESETS.find((p) => p.id === savedActivePreset)
+          const preset = findLlmPreset(savedActivePreset, savedCustomLlmPresets)
           if (preset) {
             const currentFallback = useWikiStore.getState().llmConfig
             const override = (savedProviderConfigs ?? {})[savedActivePreset]
             const resolved = resolveConfig(preset, override, currentFallback)
             useWikiStore.getState().setLlmConfig(resolved)
+            useWikiStore.getState().setGlobalLlmConfig(resolved)
             const { saveLlmConfig } = await import("@/lib/project-store")
             await saveLlmConfig(resolved)
           }
+        }
+        const savedTaskModelRouting = await loadTaskModelRouting()
+        if (savedTaskModelRouting) {
+          useWikiStore.getState().setTaskModelRouting(savedTaskModelRouting)
         }
         const savedSearchConfig = await loadSearchApiConfig()
         if (savedSearchConfig) {
@@ -391,6 +445,16 @@ function App() {
       await resetProjectState()
 
       setProject(proj)
+      const projectLlmOverride = await loadProjectLlmOverride(proj.id)
+      const llmState = useWikiStore.getState()
+      const { resolveProjectLlmConfig } = await import("@/lib/llm-task-routing")
+      llmState.setProjectLlmOverride(projectLlmOverride)
+      llmState.setLlmConfig(resolveProjectLlmConfig(
+        llmState.globalLlmConfig,
+        llmState.providerConfigs,
+        projectLlmOverride,
+        llmState.customLlmPresets,
+      ))
       const projectOutputLang = await loadOutputLanguage(proj.id)
       useWikiStore.getState().setOutputLanguage(projectOutputLang ?? "auto")
       setSelectedFile(null)
@@ -405,6 +469,21 @@ function App() {
       // Bump data version so any cached graphs/views invalidate
       useWikiStore.getState().bumpDataVersion()
       await saveLastProject(proj)
+
+      // Apply the project-specific worker limit before restoring its queue so
+      // newly enqueued tasks never start with another project's concurrency.
+      const { setIngestWorkerLimit } = await import("@/lib/ingest-queue")
+      try {
+        const config = await loadSourceWatchConfig(proj.id)
+        if (!isCurrentProject(proj)) return
+        useWikiStore.getState().setSourceWatchConfig(config)
+        setIngestWorkerLimit(config.ingestConcurrency)
+      } catch (err) {
+        console.error("Failed to load ingest concurrency:", err)
+        if (!isCurrentProject(proj)) return
+        useWikiStore.getState().setSourceWatchConfig(DEFAULT_SOURCE_WATCH_CONFIG)
+        setIngestWorkerLimit(DEFAULT_SOURCE_WATCH_CONFIG.ingestConcurrency)
+      }
 
       // Restore ingest queue (resume interrupted tasks). Keyed by the
       // project's stable UUID so the queue still finds the right project
@@ -460,9 +539,15 @@ function App() {
         useChatStore.getState().setUseWebSearch(savedChatPreferences.useWebSearch)
         useChatStore.getState().setUseAnyTxtSearch(savedChatPreferences.useAnyTxtSearch)
         useChatStore.getState().setAgentMode(savedChatPreferences.agentMode)
+        useChatStore.getState().setRetrievalMode(savedChatPreferences.retrievalMode)
+        useChatStore.getState().setDisabledSkills(savedChatPreferences.disabledSkills)
       } catch {
         // ignore, start fresh
       }
+      // Chat history must be hydrated before auto-save resumes. Otherwise the
+      // empty store created by resetProjectState() can be persisted over
+      // conversations.json before the deferred loader restores old chats.
+      await hydrateProjectChatStore(proj)
     }, () => {
       // If project loading fails after resetProjectState() and before persisted
       // review/lint/chat state has been restored, do not leave auto-save armed
@@ -483,7 +568,7 @@ function App() {
       const validated = await openProject(proj.path)
       await handleProjectOpened(validated)
     } catch (err) {
-      window.alert(`Failed to open project: ${err}`)
+      await appDialog.alert({ message: `Failed to open project: ${err}` })
     }
   }
 
@@ -498,7 +583,7 @@ function App() {
       const proj = await openProject(selected)
       await handleProjectOpened(proj)
     } catch (err) {
-      window.alert(`Failed to open project: ${err}`)
+      await appDialog.alert({ message: `Failed to open project: ${err}` })
     }
   }
 

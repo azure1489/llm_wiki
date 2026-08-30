@@ -42,6 +42,9 @@ export async function flushAndSuspendAutoSave(): Promise<void> {
       useWebSearch: chat.useWebSearch,
       useAnyTxtSearch: chat.useAnyTxtSearch,
       agentMode: chat.agentMode,
+      retrievalMode: chat.retrievalMode,
+      selectedSkills: chat.selectedSkills,
+      disabledSkills: chat.disabledSkills,
     }),
     chat.isStreaming
       ? Promise.resolve()
@@ -115,6 +118,9 @@ export function setupAutoSave(): void {
             useWebSearch: state.useWebSearch,
             useAnyTxtSearch: state.useAnyTxtSearch,
             agentMode: state.agentMode,
+            retrievalMode: state.retrievalMode,
+            selectedSkills: state.selectedSkills,
+            disabledSkills: state.disabledSkills,
           }),
           saveChatHistory(projectPath, state.conversations, state.messages),
         ]).catch(() => {})

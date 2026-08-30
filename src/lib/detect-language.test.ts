@@ -77,6 +77,10 @@ describe("detectLanguage", () => {
       expect(detectLanguage("Việt Nam là một quốc gia xinh đẹp")).toBe("Vietnamese")
     })
 
+    it("detects Czech without treating its shared ó as Polish", () => {
+      expect(detectLanguage("Příliš žluťoučký kůň úpěl ďábelské ódy")).toBe("Czech")
+    })
+
     it("detects French via word patterns (no shared diacritics)", () => {
       expect(detectLanguage("le chat noir et les chiens blancs, un homme et une femme")).toBe("French")
     })
@@ -88,6 +92,14 @@ describe("detectLanguage", () => {
 
     it("detects German via word patterns", () => {
       expect(detectLanguage("der Hund und die Katze sind nicht das Problem")).toBe("German")
+    })
+
+    it("does not classify English Markdown containing the verb die as German", () => {
+      expect(detectLanguage([
+        "# Cell lifecycle",
+        "Damaged cells die when repair pathways fail.",
+        "The remaining cells continue to divide and support the tissue.",
+      ].join("\n"))).toBe("English")
     })
 
     it("detects Spanish via word patterns", () => {

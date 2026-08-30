@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react"
 import { useTranslation } from "react-i18next"
+import { convertFileSrc } from "@tauri-apps/api/core"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
@@ -8,7 +9,8 @@ import "katex/dist/katex.min.css"
 import {
   Bot, User, FileText, BookmarkPlus, ChevronDown, ChevronRight, RefreshCw, Copy, Check,
   Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, Layout, Globe,
-  TrendingUp, Target, Sparkles, Image as ImageIcon, FileSearch,
+  TrendingUp, Target, Sparkles, Image as ImageIcon, FileSearch, Terminal,
+  ListTree,
 } from "lucide-react"
 import { openUrl } from "@tauri-apps/plugin-opener"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -18,9 +20,10 @@ import type { DisplayMessage, MessageReference } from "@/stores/chat-store"
 import type { FileNode } from "@/types/wiki"
 
 import { convertLatexToUnicode } from "@/lib/latex-to-unicode"
-import { normalizePath, getFileName } from "@/lib/path-utils"
+import { normalizePath, getFileName, isAbsolutePath } from "@/lib/path-utils"
 import { makeQueryFileName } from "@/lib/wiki-filename"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
+import { getTaskLlmConfig } from "@/lib/llm-task-routing"
 import { messageImageToDataUrl } from "@/lib/chat-image-utils"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
 import { transformImageEmbeds } from "@/lib/wikilink-transform"
@@ -30,9 +33,12 @@ import { getHtmlLang, getTextDirection } from "@/lib/language-metadata"
 import { MermaidDiagram, unwrapMermaidPre } from "@/components/mermaid-diagram"
 import { inferWikiTypeFromPath } from "@/lib/wiki-page-types"
 import { cleanAssistantContentForWikiSave, titleFromCleanAssistantContent } from "@/lib/chat-save-to-wiki"
-import type { ChatAgentEvent, ChatAgentEventStage, ChatAgentStep } from "@/lib/chat-agent"
+import type { ChatAgentEvent, ChatAgentEventStage, ChatAgentStep, ChatUserInputField, ChatUserInputRequest } from "@/lib/chat-agent-types"
 import { filterRawSourceTree } from "@/lib/source-filter"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
+import { getFileCategory, getFileExtension, isTextReadable } from "@/lib/file-types"
+import { AgentFileActivity } from "@/components/chat/agent-file-activity"
+import { ReferenceKnowledgeGraph } from "@/components/chat/reference-knowledge-graph"
 
 // Module-level cache of source file names
 let cachedSourceFiles: string[] = []
@@ -72,7 +78,10 @@ interface ChatMessageProps {
   message: DisplayMessage
   isLastAssistant?: boolean
   onRegenerate?: () => void
-  onOpenReferencePreview?: (preview: ChatReferencePreview) => void
+  onOpenReferencePreview?: (preview: ChatReferencePreview, relatedPreviews?: ChatReferencePreview[]) => void
+  onOpenContextDetails?: (references: MessageReference[]) => void
+  onApproveShellCommand?: (command: string, assistantMessageId: string) => void
+  onSubmitUserInput?: (request: ChatUserInputRequest, answers: Record<string, unknown>) => boolean
 }
 
 export interface ChatReferencePreview {
@@ -84,7 +93,16 @@ export interface ChatReferencePreview {
   snippet?: string
 }
 
-function ChatMessageImpl({ message, isLastAssistant, onRegenerate, onOpenReferencePreview }: ChatMessageProps) {
+function ChatMessageImpl({
+  message,
+  isLastAssistant,
+  onRegenerate,
+  onOpenReferencePreview,
+  onOpenContextDetails,
+  onApproveShellCommand,
+  onSubmitUserInput,
+}: ChatMessageProps) {
+  const { t } = useTranslation()
   const isUser = message.role === "user"
   const isSystem = message.role === "system"
   const isAssistant = message.role === "assistant"
@@ -108,6 +126,20 @@ function ChatMessageImpl({ message, isLastAssistant, onRegenerate, onOpenReferen
         {isUser ? <User className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
       </div>
       <div className="max-w-[80%] flex flex-col gap-1.5">
+        {isUser && message.contextFiles && message.contextFiles.length > 0 && (
+          <div className="flex flex-wrap justify-end gap-1">
+            {message.contextFiles.map((path) => (
+              <span
+                key={path}
+                className="inline-flex h-7 max-w-[18rem] items-center gap-1.5 rounded-md border border-blue-500/25 bg-blue-500/10 px-2 text-xs font-medium text-blue-700 dark:text-blue-300"
+                title={path}
+              >
+                <FileText className="h-3 w-3 shrink-0" />
+                <span className="truncate">@{getFileName(path)}</span>
+              </span>
+            ))}
+          </div>
+        )}
         {isUser && message.images && message.images.length > 0 && (
           <div className={`flex flex-wrap gap-1.5 ${isUser ? "justify-end" : ""}`}>
             {message.images.map((img, i) => (
@@ -122,7 +154,15 @@ function ChatMessageImpl({ message, isLastAssistant, onRegenerate, onOpenReferen
           </div>
         )}
         {isAssistant && (
-          <SavedAgentActivity steps={message.agentSteps ?? []} />
+          (message.agentSteps?.some((step) => step.type !== "final") ?? false)
+          || (message.agentFileChanges?.length ?? 0) > 0
+        ) && (
+          <AgentTurnActivity
+            steps={message.agentSteps ?? []}
+            changes={message.agentFileChanges ?? []}
+            canApproveShellCommand={Boolean(isLastAssistant && onApproveShellCommand)}
+            onApproveShellCommand={(command) => onApproveShellCommand?.(command, message.id)}
+          />
         )}
         {(!isUser || message.content) && (
           <div
@@ -144,6 +184,13 @@ function ChatMessageImpl({ message, isLastAssistant, onRegenerate, onOpenReferen
             content={message.content}
             savedReferences={message.references}
             onOpenReferencePreview={onOpenReferencePreview}
+            onOpenContextDetails={onOpenContextDetails}
+          />
+        )}
+        {isAssistant && message.userInputRequest && (
+          <UserInputRequestPanel
+            request={message.userInputRequest}
+            onSubmit={onSubmitUserInput}
           />
         )}
         {isAssistant && hovered && (
@@ -155,9 +202,9 @@ function ChatMessageImpl({ message, isLastAssistant, onRegenerate, onOpenReferen
                 type="button"
                 onClick={onRegenerate}
                 className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"
-                title="Regenerate this response"
+                title={t("chat.regenerateResponse")}
               >
-                <RefreshCw className="h-3 w-3" /> Regenerate
+                <RefreshCw className="h-3 w-3" /> {t("chat.regenerate")}
               </button>
             )}
           </div>
@@ -167,7 +214,51 @@ function ChatMessageImpl({ message, isLastAssistant, onRegenerate, onOpenReferen
   )
 }
 
-function SavedAgentActivity({ steps }: { steps: ChatAgentStep[] }) {
+function AgentTurnActivity({
+  steps,
+  changes,
+  canApproveShellCommand,
+  onApproveShellCommand,
+}: {
+  steps: ChatAgentStep[]
+  changes: NonNullable<DisplayMessage["agentFileChanges"]>
+  canApproveShellCommand?: boolean
+  onApproveShellCommand?: (command: string) => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <section className="rounded-md border border-border/50 bg-background/50" aria-label={t("chat.agentChanges.taskTitle")}>
+      <div className="flex items-center justify-between border-b border-border/50 px-2.5 py-1.5">
+        <span className="text-xs font-medium">{t("chat.agentChanges.taskTitle")}</span>
+        {changes.length > 0 && (
+          <span className="text-[10px] text-muted-foreground">
+            {t("chat.agentChanges.fileCount", { count: new Set(changes.map((change) => change.path)).size })}
+          </span>
+        )}
+      </div>
+      <SavedAgentActivity
+        steps={steps}
+        canApproveShellCommand={canApproveShellCommand}
+        onApproveShellCommand={onApproveShellCommand}
+        embedded
+      />
+      {changes.length > 0 && <AgentFileActivity changes={changes} embedded />}
+    </section>
+  )
+}
+
+function SavedAgentActivity({
+  steps,
+  canApproveShellCommand,
+  onApproveShellCommand,
+  embedded = false,
+}: {
+  steps: ChatAgentStep[]
+  canApproveShellCommand?: boolean
+  onApproveShellCommand?: (command: string) => void
+  embedded?: boolean
+}) {
+  const { t } = useTranslation()
   const events = useMemo<ChatAgentEvent[]>(() => steps
     .filter((step) => step.type !== "final")
     .map((step) => ({
@@ -183,13 +274,41 @@ function SavedAgentActivity({ steps }: { steps: ChatAgentStep[] }) {
       message: step.message,
       count: step.count,
       status: step.status,
+      timestamp: step.timestamp,
     })), [steps])
-  if (events.length === 0) return null
+  const shellCommand = useMemo(() => extractShellApprovalCommand(steps), [steps])
+  if (events.length === 0 && !shellCommand) return null
   return (
-    <div className="rounded-md border border-border/50 bg-background/50 px-2 py-1">
-      <AgentActivity events={events} compact />
+    <div className={embedded ? "space-y-1 border-b border-border/40 px-2 py-1.5" : "space-y-1 rounded-md border border-border/50 bg-background/50 px-2 py-1"}>
+      {events.length > 0 && <AgentActivity events={events} compact />}
+      {shellCommand && canApproveShellCommand && (
+        <button
+          type="button"
+          onClick={() => onApproveShellCommand?.(shellCommand)}
+          className="flex w-full max-w-full items-start gap-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-left text-[11px] text-amber-700 transition-colors hover:bg-amber-500/20 dark:text-amber-300"
+          title={shellCommand}
+        >
+          <Terminal className="h-3 w-3 shrink-0" />
+          <span className="shrink-0">{t("chat.approveCommand")}</span>
+          <code className="whitespace-pre-wrap break-all font-mono text-[10px] text-foreground dark:text-foreground">
+            {shellCommand}
+          </code>
+        </button>
+      )}
     </div>
   )
+}
+
+function extractShellApprovalCommand(steps: ChatAgentStep[]): string | null {
+  for (const step of steps) {
+    if (step.tool !== "shell_exec" || step.status !== "skipped") continue
+    const message = step.message?.trim() ?? ""
+    const command = message.startsWith("approval required:")
+      ? message.slice("approval required:".length).trim()
+      : ""
+    if (command) return command
+  }
+  return null
 }
 
 export const ChatMessage = memo(ChatMessageImpl, (prev, next) =>
@@ -197,9 +316,206 @@ export const ChatMessage = memo(ChatMessageImpl, (prev, next) =>
   && prev.isLastAssistant === next.isLastAssistant
   && prev.onRegenerate === next.onRegenerate
   && prev.onOpenReferencePreview === next.onOpenReferencePreview
+  && prev.onApproveShellCommand === next.onApproveShellCommand
+  && prev.onSubmitUserInput === next.onSubmitUserInput
 )
 
+function UserInputRequestPanel({
+  request,
+  onSubmit,
+}: {
+  request: ChatUserInputRequest
+  onSubmit?: (request: ChatUserInputRequest, answers: Record<string, unknown>) => boolean
+}) {
+  const { t } = useTranslation()
+  const [answers, setAnswers] = useState<Record<string, unknown>>(() => initialUserInputAnswers(request))
+  const [submitted, setSubmitted] = useState(false)
+  const canSubmit = Boolean(onSubmit) && !submitted
+
+  const update = useCallback((id: string, value: unknown) => {
+    setAnswers((prev) => ({ ...prev, [id]: value }))
+  }, [])
+
+  return (
+    <div className="rounded-lg border border-primary/20 bg-background px-3 py-3 shadow-sm">
+      <div className="mb-3">
+        <div className="text-sm font-medium text-foreground">{request.title}</div>
+        {request.description && (
+          <p className="mt-1 text-xs text-muted-foreground">{request.description}</p>
+        )}
+      </div>
+      <div className="space-y-3">
+        {request.fields.map((field) => (
+          <UserInputFieldControl
+            key={field.id}
+            field={field}
+            value={answers[field.id]}
+            disabled={!canSubmit}
+            onChange={(value) => update(field.id, value)}
+          />
+        ))}
+      </div>
+      <div className="mt-3 flex justify-end">
+        <button
+          type="button"
+          disabled={!canSubmit}
+          onClick={() => {
+            if (!canSubmit) return
+            if (onSubmit?.(request, answers)) {
+              setSubmitted(true)
+            }
+          }}
+          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          <Check className="h-3.5 w-3.5" />
+          {submitted ? t("chat.userInputSubmitted") : t("chat.userInputSubmit")}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function UserInputFieldControl({
+  field,
+  value,
+  disabled,
+  onChange,
+}: {
+  field: ChatUserInputField
+  value: unknown
+  disabled?: boolean
+  onChange: (value: unknown) => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <div className="space-y-1.5">
+      <div>
+        <label className="text-xs font-medium text-foreground">{field.label}</label>
+        {field.description && (
+          <p className="mt-0.5 text-[11px] text-muted-foreground">{field.description}</p>
+        )}
+      </div>
+      {field.type === "single" && (
+        <div className="grid gap-1.5">
+          {(field.options ?? []).map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              disabled={disabled}
+              onClick={() => onChange(option.value)}
+              className={`rounded-md border px-2.5 py-2 text-left text-xs transition-colors ${
+                value === option.value
+                  ? "border-primary bg-primary/10 text-foreground"
+                  : "border-border bg-muted/30 text-muted-foreground hover:bg-muted"
+              } disabled:cursor-not-allowed disabled:opacity-70`}
+            >
+              <span className="flex items-center justify-between gap-2">
+                <span className="font-medium">{option.label}</span>
+                {option.recommended && (
+                  <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">
+                    {t("chat.userInputRecommended")}
+                  </span>
+                )}
+              </span>
+              {option.description && (
+                <span className="mt-0.5 block text-[11px] opacity-80">{option.description}</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+      {field.type === "multi" && (
+        <div className="grid gap-1.5">
+          {(field.options ?? []).map((option) => {
+            const selected = Array.isArray(value) && value.includes(option.value)
+            return (
+              <label
+                key={option.value}
+                className={`flex cursor-pointer items-start gap-2 rounded-md border px-2.5 py-2 text-xs transition-colors ${
+                  selected ? "border-primary bg-primary/10" : "border-border bg-muted/30 hover:bg-muted"
+                } ${disabled ? "cursor-not-allowed opacity-70" : ""}`}
+              >
+                <input
+                  type="checkbox"
+                  disabled={disabled}
+                  checked={selected}
+                  onChange={(event) => {
+                    const current = Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []
+                    onChange(event.target.checked
+                      ? [...current, option.value]
+                      : current.filter((item) => item !== option.value))
+                  }}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="font-medium text-foreground">{option.label}</span>
+                  {option.description && (
+                    <span className="mt-0.5 block text-[11px] text-muted-foreground">{option.description}</span>
+                  )}
+                </span>
+              </label>
+            )
+          })}
+        </div>
+      )}
+      {field.type === "text" && (
+        <input
+          disabled={disabled}
+          value={typeof value === "string" ? value : ""}
+          placeholder={field.placeholder}
+          onChange={(event) => onChange(event.target.value)}
+          className="w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-sm outline-none focus:border-primary disabled:opacity-70"
+        />
+      )}
+      {field.type === "textarea" && (
+        <textarea
+          disabled={disabled}
+          value={typeof value === "string" ? value : ""}
+          placeholder={field.placeholder}
+          onChange={(event) => onChange(event.target.value)}
+          rows={4}
+          className="w-full resize-y rounded-md border border-border bg-background px-2.5 py-1.5 text-sm outline-none focus:border-primary disabled:opacity-70"
+        />
+      )}
+      {field.type === "confirm" && (
+        <label className={`flex items-center gap-2 text-sm ${disabled ? "opacity-70" : ""}`}>
+          <input
+            type="checkbox"
+            disabled={disabled}
+            checked={Boolean(value)}
+            onChange={(event) => onChange(event.target.checked)}
+          />
+          <span>{field.placeholder ?? t("chat.userInputEnabled")}</span>
+        </label>
+      )}
+    </div>
+  )
+}
+
+function initialUserInputAnswers(request: ChatUserInputRequest): Record<string, unknown> {
+  const answers: Record<string, unknown> = {}
+  for (const field of request.fields) {
+    if (field.defaultValue !== undefined) {
+      answers[field.id] = field.defaultValue
+      continue
+    }
+    if (field.type === "single") {
+      answers[field.id] = field.options?.find((option) => option.recommended)?.value
+        ?? field.options?.[0]?.value
+        ?? ""
+    } else if (field.type === "multi") {
+      answers[field.id] = []
+    } else if (field.type === "confirm") {
+      answers[field.id] = false
+    } else {
+      answers[field.id] = ""
+    }
+  }
+  return answers
+}
+
 function CopyButton({ content }: { content: string }) {
+  const { t } = useTranslation()
   const [copied, setCopied] = useState(false)
 
   const handleCopy = useCallback(async () => {
@@ -220,15 +536,16 @@ function CopyButton({ content }: { content: string }) {
       type="button"
       onClick={handleCopy}
       className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"
-      title="Copy to clipboard"
+      title={t("chat.copyToClipboard")}
     >
       {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-      {copied ? "Copied!" : "Copy"}
+      {copied ? t("chat.copied") : t("chat.copy")}
     </button>
   )
 }
 
 function SaveToWikiButton({ content, visible }: { content: string; visible: boolean }) {
+  const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const [saved, setSaved] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -300,7 +617,7 @@ function SaveToWikiButton({ content, visible }: { content: string; visible: bool
       setTimeout(() => setSaved(false), 2000)
 
       // Full auto-ingest: extract entities, concepts, cross-references from saved content
-      const llmConfig = useWikiStore.getState().llmConfig
+      const llmConfig = getTaskLlmConfig("ingest")
       if (hasUsableLlm(llmConfig)) {
         const { autoIngest } = await import("@/lib/ingest")
         autoIngest(pp, filePath, llmConfig).catch((err) =>
@@ -322,10 +639,10 @@ function SaveToWikiButton({ content, visible }: { content: string; visible: bool
       onClick={handleSave}
       disabled={saving}
       className="self-start inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"
-      title="Save to wiki"
+      title={t("chat.saveToWiki")}
     >
       <BookmarkPlus className="h-3 w-3" />
-      {saved ? "Saved!" : saving ? "Saving..." : "Save to Wiki"}
+      {saved ? t("chat.saved") : saving ? t("chat.saving") : t("chat.saveToWiki")}
     </button>
   )
 }
@@ -346,9 +663,11 @@ const REF_TYPE_CONFIG: Record<string, { icon: typeof FileText; color: string }> 
   clip: { icon: Globe, color: "text-blue-400" },
   external: { icon: Globe, color: "text-sky-500" },
   anytxt: { icon: FileSearch, color: "text-emerald-500" },
+  workspace: { icon: FileText, color: "text-cyan-500" },
 }
 
 function getRefType(path: string, page?: CitedPage): string {
+  if (page?.kind === "workspace") return "workspace"
   if (page?.kind === "external") {
     return page.source?.toLowerCase() === "anytxt" ? "anytxt" : "external"
   }
@@ -379,6 +698,7 @@ function isAnyTxtReference(page: CitedPage): boolean {
 
 function referenceSourceLabel(page: CitedPage): string {
   if (isAnyTxtReference(page)) return "AnyTXT"
+  if (page.kind === "workspace") return "Workspace"
   if (page.kind === "external") return page.source || "Web"
   return "Wiki"
 }
@@ -396,8 +716,17 @@ function projectAbsolutePath(projectPath: string, path: string): string {
   const pp = normalizePath(projectPath)
   const normalized = normalizePath(path)
   if (normalized.startsWith(`${pp}/`)) return normalized
-  if (normalized.startsWith("/")) return normalized
+  if (isAbsolutePath(normalized)) return normalized
   return `${pp}/${normalized.replace(/^\/+/, "")}`
+}
+
+function isAgentWorkspacePath(filePath: string): boolean {
+  return normalizePath(filePath).split("/").includes("agent-workspace")
+}
+
+function isGeneratedOutputImage(filePath: string): boolean {
+  const category = getFileCategory(filePath)
+  return category === "image" || (getFileExtension(filePath) === "svg" && isAgentWorkspacePath(filePath))
 }
 
 /**
@@ -424,15 +753,19 @@ function CitedReferencesPanel({
   content,
   savedReferences,
   onOpenReferencePreview,
+  onOpenContextDetails,
 }: {
   content: string
   savedReferences?: CitedPage[]
-  onOpenReferencePreview?: (preview: ChatReferencePreview) => void
+  onOpenReferencePreview?: (preview: ChatReferencePreview, relatedPreviews?: ChatReferencePreview[]) => void
+  onOpenContextDetails?: (references: MessageReference[]) => void
 }) {
+  const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const openFileInPreview = useWikiStore((s) => s.openFileInPreview)
   const setPendingScrollImageSrc = useWikiStore((s) => s.setPendingScrollImageSrc)
   const [expanded, setExpanded] = useState(false)
+  const [outputsExpanded, setOutputsExpanded] = useState(false)
   /**
    * Per-cited-page image info: count + first image URL. We can't
    * hang this off `CitedPage` directly because `extractCitedPages`
@@ -444,10 +777,18 @@ function CitedReferencesPanel({
   const [imageInfos, setImageInfos] = useState<Record<string, CitedImageInfo>>({})
 
   // Use saved references first (persisted with message), fall back to dynamic extraction
+  const generatedOutputs = useMemo(() => (
+    (savedReferences ?? []).filter((page) => page.kind === "workspace")
+  ), [savedReferences])
   const citedPages = useMemo(() => {
-    if (savedReferences && savedReferences.length > 0) return savedReferences
+    if (savedReferences && savedReferences.length > 0) {
+      return savedReferences.filter((page) => page.kind !== "workspace")
+    }
     return extractCitedPages(content)
   }, [content, savedReferences])
+  const contextReferences = savedReferences && savedReferences.length > 0
+    ? savedReferences
+    : citedPages
 
   // Async-fetch each cited page's content once and extract image
   // info: count + first URL. Done in parallel; failures are
@@ -462,7 +803,7 @@ function CitedReferencesPanel({
         // Try the path verbatim first, then the same fallback set
         // the click-handler uses below — keeps "is the file on
         // disk" check consistent across the panel.
-        if (page.kind === "external") {
+        if (page.kind === "external" || page.kind === "workspace") {
           return [page.path, { count: 0, firstUrl: null }] as const
         }
         const id = getFileName(page.path.replace(/^wiki\//, "").replace(/\.md$/, ""))
@@ -561,120 +902,257 @@ function CitedReferencesPanel({
     [project, setPendingScrollImageSrc, openFileInPreview, onOpenReferencePreview],
   )
 
-  if (citedPages.length === 0) return null
+  const openCitedPage = useCallback(async (page: CitedPage) => {
+    if (page.kind === "workspace") {
+      if (!project) return
+      const pp = normalizePath(project.path)
+      const workspacePath = projectAbsolutePath(pp, page.path)
+      const relatedOutputPreviews = generatedOutputs.map((output) => {
+        const outputPath = projectAbsolutePath(pp, output.path)
+        return {
+          title: output.title,
+          path: outputPath,
+          source: output.source ?? "Workspace",
+          content: output.path === page.path ? page.snippet ?? "" : "",
+          snippet: output.snippet,
+        }
+      })
+      try {
+        const category = getFileCategory(workspacePath)
+        const shouldReadContent = isTextReadable(category) || category === "pdf"
+        const content = shouldReadContent ? await readFile(workspacePath) : ""
+        if (onOpenReferencePreview) {
+          onOpenReferencePreview({
+            title: page.title,
+            path: workspacePath,
+            source: page.source ?? "Workspace",
+            content,
+            snippet: page.snippet,
+          }, relatedOutputPreviews)
+        } else {
+          openFileInPreview(workspacePath, content)
+        }
+      } catch (err) {
+        console.warn("[chat refs] failed to open workspace reference:", err)
+        if (onOpenReferencePreview) {
+          onOpenReferencePreview({
+            title: page.title,
+            path: workspacePath,
+            source: page.source ?? "Workspace",
+            content: `Unable to load generated file: ${page.path}`,
+            snippet: page.snippet,
+          }, relatedOutputPreviews)
+        }
+      }
+      return
+    }
+    if (page.kind === "external") {
+      const target = page.url || page.path
+      const displayPath = displayExternalPath(page)
+      const previewPath = `${isAnyTxtReference(page) ? "anytxt" : "external"}-preview://${encodeURIComponent(target || page.title)}`
+      const previewContent = [
+        `# ${page.title}`,
+        "",
+        `**Source:** ${referenceSourceLabel(page)}`,
+        `**Path:** ${displayPath}`,
+        "",
+        "## Preview",
+        "",
+        page.snippet?.trim() || "(No preview fragment returned.)",
+      ].join("\n")
+      if (onOpenReferencePreview) {
+        onOpenReferencePreview({
+          title: page.title,
+          path: displayPath,
+          source: referenceSourceLabel(page),
+          external: true,
+          content: previewContent,
+          snippet: page.snippet ?? "",
+        })
+        return
+      }
+      if (isAnyTxtReference(page)) {
+        openFileInPreview(previewPath, previewContent)
+        useWikiStore.getState().setExternalPreview({
+          title: page.title,
+          path: previewPath,
+          source: referenceSourceLabel(page),
+          url: displayPath,
+          snippet: page.snippet ?? "",
+        })
+        return
+      }
+      if (target) {
+        await openUrl(target).catch((err) => {
+          console.warn("[chat refs] failed to open external reference:", err)
+        })
+      }
+      return
+    }
+    if (!project) return
+    const pp = normalizePath(project.path)
+    const id = getFileName(page.path.replace(/^wiki\//, "").replace(/\.md$/, ""))
+    const candidates = [
+      projectAbsolutePath(pp, page.path),
+      `${pp}/wiki/entities/${id}.md`,
+      `${pp}/wiki/concepts/${id}.md`,
+      `${pp}/wiki/sources/${id}.md`,
+      `${pp}/wiki/queries/${id}.md`,
+      `${pp}/wiki/synthesis/${id}.md`,
+      `${pp}/wiki/comparisons/${id}.md`,
+      `${pp}/wiki/${id}.md`,
+    ]
+    for (const candidate of candidates) {
+      try {
+        const content = await readFile(candidate)
+        if (onOpenReferencePreview) {
+          onOpenReferencePreview({
+            title: page.title,
+            path: candidate,
+            content,
+          })
+        } else {
+          openFileInPreview(candidate, content)
+        }
+        return
+      } catch {
+        // try next
+      }
+    }
+    const fallbackPath = projectAbsolutePath(pp, page.path)
+    const fallbackContent = `Unable to load: ${page.path}`
+    if (onOpenReferencePreview) {
+      onOpenReferencePreview({
+        title: page.title,
+        path: fallbackPath,
+        content: fallbackContent,
+      })
+    } else {
+      openFileInPreview(fallbackPath, fallbackContent)
+    }
+  }, [project, generatedOutputs, onOpenReferencePreview, openFileInPreview])
+
+  if (citedPages.length === 0 && generatedOutputs.length === 0) return null
 
   const MAX_COLLAPSED = 3
   const visiblePages = expanded ? citedPages : citedPages.slice(0, MAX_COLLAPSED)
+  const visibleOutputs = outputsExpanded ? generatedOutputs : generatedOutputs.slice(0, MAX_COLLAPSED)
   const hasMore = citedPages.length > MAX_COLLAPSED
+  const hasMoreOutputs = generatedOutputs.length > MAX_COLLAPSED
 
   return (
-    <div className="rounded-md border border-border/60 bg-muted/30 text-xs mb-1">
-      <button
-        type="button"
-        onClick={() => hasMore && setExpanded(!expanded)}
-        className="flex w-full items-center gap-1.5 px-2 py-1 text-muted-foreground hover:text-foreground transition-colors"
-      >
-        <FileText className="h-3 w-3 shrink-0" />
-        <span className="font-medium">References ({citedPages.length})</span>
-        {hasMore && (
-          expanded
-            ? <ChevronDown className="h-3 w-3 ml-auto" />
-            : <ChevronRight className="h-3 w-3 ml-auto" />
-        )}
-      </button>
-      <div className="px-2 pb-1.5">
+    <div className="space-y-1">
+      {generatedOutputs.length > 0 && (
+        <div className="rounded-md border border-primary/20 bg-primary/5 text-xs mb-1">
+          <button
+            type="button"
+            onClick={() => hasMoreOutputs && setOutputsExpanded(!outputsExpanded)}
+            className="flex w-full items-center gap-1.5 px-2 py-1 text-primary transition-colors hover:text-primary/80"
+          >
+            <Sparkles className="h-3 w-3 shrink-0" />
+            <span className="font-medium">{t("chat.generatedOutputs")} ({generatedOutputs.length})</span>
+            {hasMoreOutputs && (
+              outputsExpanded
+                ? <ChevronDown className="h-3 w-3 ml-auto" />
+                : <ChevronRight className="h-3 w-3 ml-auto" />
+            )}
+          </button>
+          <div className="px-2 pb-1.5">
+            {visibleOutputs.map((page, i) => {
+              const refType = getRefType(page.path, page)
+              const config = REF_TYPE_CONFIG[refType] ?? REF_TYPE_CONFIG.source
+              const Icon = config.icon
+              const absoluteOutputPath = project ? projectAbsolutePath(project.path, page.path) : page.path
+              const isImageOutput = isGeneratedOutputImage(absoluteOutputPath)
+              const imageSrc = isImageOutput ? convertFileSrc(absoluteOutputPath) : null
+              return (
+                <div
+                  key={page.path}
+                  className="flex w-full items-start gap-1.5 rounded text-left"
+                  title={page.path}
+                >
+                  <span className="mt-1 text-[10px] text-primary/60 w-4 shrink-0 text-right">[{i + 1}]</span>
+                  <button
+                    type="button"
+                    onClick={() => openCitedPage(page)}
+                    className="flex min-w-0 flex-1 items-start gap-2 rounded px-1 py-1 text-left hover:bg-primary/10 transition-colors"
+                  >
+                    {imageSrc ? (
+                      <span className="h-14 w-20 shrink-0 overflow-hidden rounded border border-primary/20 bg-background/80">
+                        <img
+                          src={imageSrc}
+                          alt={page.title}
+                          loading="lazy"
+                          className="h-full w-full object-cover"
+                          onError={(event) => {
+                            event.currentTarget.style.opacity = "0"
+                          }}
+                        />
+                      </span>
+                    ) : (
+                      <Icon className={`mt-0.5 h-3 w-3 shrink-0 ${config.color}`} />
+                    )}
+                    <span className="min-w-0 flex-1 text-foreground/90">
+                      <span className="block truncate">{page.title}</span>
+                      <span className="mt-0.5 block truncate text-[10px] text-muted-foreground/75">
+                        {referenceLocator(page)}
+                      </span>
+                    </span>
+                    <span className="shrink-0 rounded border border-primary/20 bg-background/80 px-1 py-0 text-[10px] text-primary">
+                      {t("chat.generatedOutput")}
+                    </span>
+                  </button>
+                </div>
+              )
+            })}
+            {hasMoreOutputs && !outputsExpanded && (
+              <button
+                type="button"
+                onClick={() => setOutputsExpanded(true)}
+                className="w-full text-center text-[10px] text-primary/70 hover:text-primary pt-0.5"
+              >
+                +{generatedOutputs.length - MAX_COLLAPSED} more...
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      {citedPages.length > 0 && (
+        <div className="rounded-md border border-border/60 bg-muted/30 text-xs mb-1">
+          <div className="flex items-center px-2 py-1 text-muted-foreground">
+            <button
+              type="button"
+              onClick={() => hasMore && setExpanded(!expanded)}
+              className="flex min-w-0 flex-1 items-center gap-1.5 text-left hover:text-foreground transition-colors"
+            >
+              <FileText className="h-3 w-3 shrink-0" />
+              <span className="font-medium">{t("chat.references")} ({citedPages.length})</span>
+              {hasMore && (
+                expanded
+                  ? <ChevronDown className="h-3 w-3 ml-auto" />
+                  : <ChevronRight className="h-3 w-3 ml-auto" />
+              )}
+            </button>
+            {onOpenContextDetails && (
+              <button
+                type="button"
+                onClick={() => onOpenContextDetails(contextReferences)}
+                className="ml-2 inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] hover:bg-accent hover:text-foreground"
+                title={t("chat.contextDetails")}
+              >
+                <ListTree className="h-3 w-3" />
+                {t("chat.details")}
+              </button>
+            )}
+          </div>
+          <div className="px-2 pb-1.5">
+        <ReferenceKnowledgeGraph references={citedPages} onOpenReference={openCitedPage} />
         {visiblePages.map((page, i) => {
           const refType = getRefType(page.path, page)
           const config = REF_TYPE_CONFIG[refType] ?? REF_TYPE_CONFIG.source
           const Icon = config.icon
           const info = imageInfos[page.path]
           const hasImages = (info?.count ?? 0) > 0
-          const openCitedPage = async () => {
-            if (page.kind === "external") {
-              const target = page.url || page.path
-              const displayPath = displayExternalPath(page)
-              const previewPath = `${isAnyTxtReference(page) ? "anytxt" : "external"}-preview://${encodeURIComponent(target || page.title)}`
-              const previewContent = [
-                `# ${page.title}`,
-                "",
-                `**Source:** ${referenceSourceLabel(page)}`,
-                `**Path:** ${displayPath}`,
-                "",
-                "## Preview",
-                "",
-                page.snippet?.trim() || "(No preview fragment returned.)",
-              ].join("\n")
-              if (onOpenReferencePreview) {
-                onOpenReferencePreview({
-                  title: page.title,
-                  path: displayPath,
-                  source: referenceSourceLabel(page),
-                  external: true,
-                  content: previewContent,
-                  snippet: page.snippet ?? "",
-                })
-                return
-              }
-              if (isAnyTxtReference(page)) {
-                openFileInPreview(previewPath, previewContent)
-                useWikiStore.getState().setExternalPreview({
-                  title: page.title,
-                  path: previewPath,
-                  source: referenceSourceLabel(page),
-                  url: displayPath,
-                  snippet: page.snippet ?? "",
-                })
-                return
-              }
-              if (target) {
-                await openUrl(target).catch((err) => {
-                  console.warn("[chat refs] failed to open external reference:", err)
-                })
-              }
-              return
-            }
-            if (!project) return
-            const pp = normalizePath(project.path)
-            const id = getFileName(page.path.replace(/^wiki\//, "").replace(/\.md$/, ""))
-            const candidates = [
-              projectAbsolutePath(pp, page.path),
-              `${pp}/wiki/entities/${id}.md`,
-              `${pp}/wiki/concepts/${id}.md`,
-              `${pp}/wiki/sources/${id}.md`,
-              `${pp}/wiki/queries/${id}.md`,
-              `${pp}/wiki/synthesis/${id}.md`,
-              `${pp}/wiki/comparisons/${id}.md`,
-              `${pp}/wiki/${id}.md`,
-            ]
-            for (const candidate of candidates) {
-              try {
-                const content = await readFile(candidate)
-                if (onOpenReferencePreview) {
-                  onOpenReferencePreview({
-                    title: page.title,
-                    path: candidate,
-                    content,
-                  })
-                } else {
-                  openFileInPreview(candidate, content)
-                }
-                return
-              } catch {
-                // try next
-              }
-            }
-            const fallbackPath = projectAbsolutePath(pp, page.path)
-            const fallbackContent = `Unable to load: ${page.path}`
-            if (onOpenReferencePreview) {
-              onOpenReferencePreview({
-                title: page.title,
-                path: fallbackPath,
-                content: fallbackContent,
-              })
-            } else {
-              openFileInPreview(fallbackPath, fallbackContent)
-            }
-          }
           return (
             // Outer is a div, NOT a button — we have two click
             // targets inside (image badge + main row) and nesting
@@ -713,7 +1191,7 @@ function CitedReferencesPanel({
               )}
               <button
                 type="button"
-                onClick={openCitedPage}
+                onClick={() => openCitedPage(page)}
                 className="flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-accent/50 transition-colors"
               >
                 <Icon className={`h-3 w-3 shrink-0 ${config.color}`} />
@@ -748,7 +1226,9 @@ function CitedReferencesPanel({
             +{citedPages.length - MAX_COLLAPSED} more...
           </button>
         )}
+          </div>
       </div>
+      )}
     </div>
   )
 }
@@ -896,6 +1376,15 @@ function AgentActivity({ events, compact = false }: { events: ChatAgentEvent[]; 
                 <span className="text-muted-foreground"> · {t("chat.agent.resultCount", { count: event.count })}</span>
               ) : null}
             </span>
+            {event.timestamp && (
+              <time className="ml-auto shrink-0 text-[10px] tabular-nums text-muted-foreground/70">
+                {new Date(event.timestamp).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  second: "2-digit",
+                })}
+              </time>
+            )}
           </div>
         )
       })}
@@ -950,7 +1439,7 @@ function MarkdownContent({ content }: { content: string }) {
     <div>
       {thinking && <ThinkingBlock content={thinking} />}
       <div
-        className="chat-markdown prose prose-sm max-w-none dark:prose-invert prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-ol:my-1 prose-li:my-0 prose-pre:my-2 prose-code:text-xs prose-code:before:content-none prose-code:after:content-none"
+        className="chat-markdown prose max-w-none dark:prose-invert prose-code:before:content-none prose-code:after:content-none"
         dir={direction}
         lang={htmlLang}
         style={{ textAlign: "start" }}
@@ -1053,6 +1542,7 @@ function separateThinking(text: string): { thinking: string | null; answer: stri
 
 /** Streaming thinking: shows latest ~5 lines rolling upward with animation */
 function StreamingThinkingBlock({ content }: { content: string }) {
+  const { t } = useTranslation()
   const lines = content.split("\n").filter((l) => l.trim())
   const visibleLines = lines.slice(-5)
 
@@ -1060,8 +1550,8 @@ function StreamingThinkingBlock({ content }: { content: string }) {
     <div className="rounded-md border border-dashed border-amber-500/30 bg-amber-50/50 dark:bg-amber-950/20 px-2.5 py-2">
       <div className="flex items-center gap-1.5 mb-1.5">
         <span className="text-sm animate-pulse">💭</span>
-        <span className="text-xs font-medium text-amber-700 dark:text-amber-400">Thinking...</span>
-        <span className="text-[10px] text-amber-600/50 dark:text-amber-500/40">{lines.length} lines</span>
+        <span className="text-xs font-medium text-amber-700 dark:text-amber-400">{t("chat.thinking")}</span>
+        <span className="text-[10px] text-amber-600/50 dark:text-amber-500/40">{t("chat.lineCount", { count: lines.length })}</span>
       </div>
       <div className="h-[5lh] overflow-hidden text-xs text-amber-800/70 dark:text-amber-300/60 font-mono leading-relaxed">
         {visibleLines.map((line, i) => (
@@ -1081,6 +1571,7 @@ function StreamingThinkingBlock({ content }: { content: string }) {
 
 /** Completed thinking: collapsed by default, click to expand */
 function ThinkingBlock({ content }: { content: string }) {
+  const { t } = useTranslation()
   const [expanded, setExpanded] = useState(false)
   const lines = content.split("\n").filter((l) => l.trim())
 
@@ -1092,7 +1583,7 @@ function ThinkingBlock({ content }: { content: string }) {
         className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-400 hover:bg-amber-100/50 dark:hover:bg-amber-900/20 transition-colors"
       >
         <span className="text-sm">💭</span>
-        <span className="font-medium">Thought for {lines.length} lines</span>
+        <span className="font-medium">{t("chat.thoughtLineCount", { count: lines.length })}</span>
         <span className="text-amber-600/60 dark:text-amber-500/60">
           {expanded ? "▼" : "▶"}
         </span>

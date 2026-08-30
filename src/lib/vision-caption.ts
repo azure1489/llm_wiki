@@ -39,6 +39,7 @@
  */
 import type { LlmConfig } from "@/stores/wiki-store"
 import { streamChat, type ChatMessage } from "./llm-client"
+import { resolveIngestReasoning } from "@/lib/reasoning-capabilities"
 
 /**
  * The "no surrounding text" prompt — same factual / verbatim /
@@ -67,7 +68,13 @@ import { streamChat, type ChatMessage } from "./llm-client"
  *     or markdown inside CAPTION corrupt the surrounding doc).
  */
 export const CAPTION_PROMPT =
-  "用简体中文客观描述这张图片，供知识库索引使用。需包含：图中可见的文字（逐字照录）、图表的坐标轴与数值、示意图结构（方框/箭头/标签）、关键视觉元素（产品外观、颜色、材质、款式等）。不要臆测或评论。2 到 4 句话。只输出纯文本——不要 markdown，不要前言。必须用简体中文输出。"
+  "Describe this image factually for a knowledge-base index. Include: any visible text verbatim, chart axes and values, diagram structure (boxes/arrows/labels), key visual elements. Do NOT speculate or editorialize. 2 to 4 sentences. Output plain text only — no markdown, no preamble."
+
+function captionLanguageInstruction(outputLanguage?: string): string {
+  const language = outputLanguage?.trim()
+  if (!language || language.toLowerCase() === "auto") return ""
+  return `Write the description in ${language}. Preserve visible text verbatim in its original language.`
+}
 
 /**
  * Build the prompt that gets used WHEN the caller supplies
@@ -83,24 +90,26 @@ export const CAPTION_PROMPT =
 export function buildCaptionPromptWithContext(
   before: string,
   after: string,
+  outputLanguage?: string,
 ): string {
   const fmt = (s: string) => {
     const trimmed = s.trim()
     return trimmed.length > 0 ? trimmed : "(none)"
   }
   return [
-    "这张图片嵌入在一份较长的文档中。以下是源文档里紧邻该图片之前和之后的文字：",
+    "The image is embedded in a longer document. Here is the text that appears IMMEDIATELY BEFORE and AFTER this image in the source:",
     "",
-    "--- 图片前的文字 ---",
+    "--- Text before image ---",
     fmt(before),
-    "--- 图片后的文字 ---",
+    "--- Text after image ---",
     fmt(after),
-    "--- 周边文字结束 ---",
+    "--- End surrounding text ---",
     "",
-    "这些周边文字可能有助于描述图片——例如「图3：第二季度营收图表」这样的句子能告诉你图表实际画的是什么；也可能只是恰好出现在图片旁边的无关正文。请自行判断：若某段文字明确指认、引用或标注了该图片，就以它为锚点；若无关，则忽略周边文字，只描述你看到的内容。",
+    "This surrounding text MAY help describe the image — for example, a sentence like \"Figure 3: Q2 revenue chart\" tells you what the chart actually plots. It MAY ALSO be unrelated body text that just happens to flank the image. Use your judgment: if a passage clearly identifies, references, or labels the image, anchor your caption to it; if not, ignore the surrounding text and describe what you see.",
     "",
-    "现在用简体中文客观描述这张图片，供知识库索引使用。需包含：图中可见的文字（逐字照录）、图表的坐标轴与数值、示意图结构（方框/箭头/标签）、关键视觉元素（产品外观、颜色、材质、款式等）。若周边文字含相关的图号/说明/指代，请具体纳入。不要臆造图中不可见、周边文字也未直接说明的细节。2 到 4 句话。只输出纯文本——不要 markdown，不要前言。必须用简体中文输出。",
-  ].join("\n")
+    "Now describe the image factually for a knowledge-base index. Include: any visible text verbatim, chart axes and values, diagram structure (boxes/arrows/labels), key visual elements. If the surrounding text contains a relevant figure number / caption / referent, incorporate that specifically. Do NOT invent details that aren't visible in the image or directly stated in the surrounding text. 2 to 4 sentences. Output plain text only — no markdown, no preamble.",
+    captionLanguageInstruction(outputLanguage),
+  ].filter(Boolean).join("\n")
 }
 
 export interface CaptionOptions {
@@ -134,6 +143,8 @@ export interface CaptionOptions {
    */
   contextBefore?: string
   contextAfter?: string
+  /** Output language for the description. Visible source text stays verbatim. */
+  outputLanguage?: string
 }
 
 /**
@@ -172,8 +183,10 @@ export async function captionImage(
   const after = options?.contextAfter?.trim() ?? ""
   const promptText =
     before.length > 0 || after.length > 0
-      ? buildCaptionPromptWithContext(before, after)
-      : CAPTION_PROMPT
+      ? buildCaptionPromptWithContext(before, after, options?.outputLanguage)
+      : [CAPTION_PROMPT, captionLanguageInstruction(options?.outputLanguage)]
+          .filter(Boolean)
+          .join("\n")
 
   const messages: ChatMessage[] = [
     {
@@ -202,12 +215,9 @@ export async function captionImage(
     {
       temperature: options?.temperature ?? 0,
       max_tokens: options?.maxTokens ?? 4096,
-      // Captioning is a short factual vision task. If the main LLM is
-      // configured as a reasoning model, inheriting that setting here
-      // often burns the small caption budget on thinking and produces
-      // no usable alt text. Disable reasoning for caption calls unless
-      // this helper grows an explicit caption-reasoning option.
-      reasoning: { mode: "off" },
+      // Captioning is a short factual vision task, so reasoning defaults off.
+      // The ingest preference can enable it for models that require thinking.
+      reasoning: resolveIngestReasoning(llmConfig),
     },
   )
 

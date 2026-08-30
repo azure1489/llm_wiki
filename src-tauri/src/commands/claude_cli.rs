@@ -28,7 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use super::cli_resolver::find_cli_command;
+use super::cli_resolver::{child_path_env, find_cli_command};
 
 const ISOLATED_MCP_CONFIG: &str = "{\"mcpServers\":{}}";
 
@@ -117,6 +117,43 @@ fn claude_content_blocks(content: &ClaudeContent) -> Vec<serde_json::Value> {
     }
 }
 
+/// Fold the system preamble into an existing user text block. Claude Code's
+/// prompt-injection guard can reject a standalone user content block that
+/// looks like a role override, even though the CLI has no portable system
+/// prompt flag across supported versions. Image-only turns have no text to
+/// merge into, so they receive one leading text block as a necessary fallback.
+fn merge_system_preamble_into_user_content(
+    content: &mut Vec<serde_json::Value>,
+    system_preamble: &str,
+) {
+    if system_preamble.is_empty() {
+        return;
+    }
+
+    for block in content.iter_mut() {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(existing) = block
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        *block = serde_json::json!({
+            "type": "text",
+            "text": format!("{system_preamble}\n\n{existing}"),
+        });
+        return;
+    }
+
+    content.insert(
+        0,
+        serde_json::json!({ "type": "text", "text": system_preamble }),
+    );
+}
+
 async fn find_claude_command() -> Result<PathBuf, String> {
     find_cli_command("claude", &["claude.cmd", "claude.exe"]).await
 }
@@ -124,8 +161,6 @@ async fn find_claude_command() -> Result<PathBuf, String> {
 fn suppress_windows_console(_cmd: &mut Command) {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         _cmd.creation_flags(CREATE_NO_WINDOW);
     }
@@ -152,6 +187,11 @@ pub async fn claude_cli_detect() -> Result<DetectResult, String> {
 
     let mut cmd = Command::new(&path);
     suppress_windows_console(&mut cmd);
+    // npm-installed Claude is a Node shim. Desktop apps do not inherit the
+    // user's login-shell PATH, so detection and execution must both supply it.
+    if let Some(path_env) = child_path_env().await {
+        cmd.env("PATH", path_env);
+    }
     let output = tokio::time::timeout(Duration::from_secs(3), cmd.arg("--version").output()).await;
 
     match output {
@@ -244,10 +284,7 @@ pub async fn claude_cli_spawn(
             let role = m.role.clone();
             let mut content = claude_content_blocks(&m.content);
             if !first_user_seen && role == "user" && !system_preamble.is_empty() {
-                content.insert(
-                    0,
-                    serde_json::json!({ "type": "text", "text": format!("{system_preamble}\n\n") }),
-                );
+                merge_system_preamble_into_user_content(&mut content, &system_preamble);
                 first_user_seen = true;
             }
             (role, content)
@@ -258,6 +295,9 @@ pub async fn claude_cli_spawn(
     let claude = find_claude_command().await?;
     let mut cmd = Command::new(&claude);
     suppress_windows_console(&mut cmd);
+    if let Some(path_env) = child_path_env().await {
+        cmd.env("PATH", path_env);
+    }
     cmd.args(build_claude_cli_args(&model, isolate_local_config));
     cmd.current_dir(&working_directory);
 
@@ -404,11 +444,6 @@ fn build_claude_cli_args(model: &str, isolate_local_config: bool) -> Vec<String>
         args.extend([
             "--setting-sources".to_string(),
             "project".to_string(),
-            "--strict-mcp-config".to_string(),
-            "--mcp-config".to_string(),
-            // Claude's strict MCP config expects the top-level mcpServers key
-            // even when the isolated server set is intentionally empty.
-            ISOLATED_MCP_CONFIG.to_string(),
             "--disable-slash-commands".to_string(),
             "--tools".to_string(),
             "".to_string(),
@@ -419,6 +454,16 @@ fn build_claude_cli_args(model: &str, isolate_local_config: bool) -> Vec<String>
     }
 
     args.extend(["--model".to_string(), model.to_string()]);
+    if isolate_local_config {
+        // `--mcp-config` accepts multiple space-separated values. Keep its
+        // inline JSON last so Claude's argument parser cannot consume later
+        // flags as additional config paths, especially through Windows shims.
+        args.extend([
+            "--strict-mcp-config".to_string(),
+            "--mcp-config".to_string(),
+            ISOLATED_MCP_CONFIG.to_string(),
+        ]);
+    }
     args
 }
 
@@ -520,6 +565,52 @@ mod tests {
     }
 
     #[test]
+    fn system_preamble_merges_into_existing_user_text_block() {
+        let mut blocks = vec![
+            serde_json::json!({ "type": "text", "text": "Output the token" }),
+            serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": "abc123" },
+            }),
+        ];
+
+        merge_system_preamble_into_user_content(&mut blocks, "System instructions");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0],
+            serde_json::json!({
+                "type": "text",
+                "text": "System instructions\n\nOutput the token",
+            })
+        );
+        assert_eq!(
+            blocks[1].get("type").and_then(serde_json::Value::as_str),
+            Some("image")
+        );
+    }
+
+    #[test]
+    fn system_preamble_adds_text_block_only_for_image_only_turn() {
+        let mut blocks = vec![serde_json::json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": "image/png", "data": "abc123" },
+        })];
+
+        merge_system_preamble_into_user_content(&mut blocks, "System instructions");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0],
+            serde_json::json!({ "type": "text", "text": "System instructions" })
+        );
+        assert_eq!(
+            blocks[1].get("type").and_then(serde_json::Value::as_str),
+            Some("image")
+        );
+    }
+
+    #[test]
     fn claude_args_do_not_isolate_local_config_by_default() {
         let args = build_claude_cli_args("sonnet", false);
 
@@ -558,6 +649,10 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--prompt-suggestions" && pair[1] == "false"));
+        assert_eq!(
+            &args[args.len() - 3..],
+            ["--strict-mcp-config", "--mcp-config", ISOLATED_MCP_CONFIG]
+        );
     }
 
     #[tokio::test]

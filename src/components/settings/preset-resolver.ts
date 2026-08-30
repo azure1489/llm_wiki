@@ -35,11 +35,24 @@ export function resolveConfig(
   const maxContextSize =
     ov.maxContextSize ?? preset.suggestedContextSize ?? fallback.maxContextSize
   const reasoning = ov.reasoning ?? { mode: "auto" as const }
+  // Carried alongside `reasoning`: without it the ingest selector would save a
+  // value the resolved config drops, and ingest would keep using the default.
+  const ingestReasoning = ov.ingestReasoning ?? { mode: "off" as const }
   const localCliIsolation = ov.localCliIsolation === true
   const codexCliTimeoutMinutes =
     typeof ov.codexCliTimeoutMinutes === "number" && Number.isFinite(ov.codexCliTimeoutMinutes)
       ? Math.max(1, Math.min(240, Math.floor(ov.codexCliTimeoutMinutes)))
       : undefined
+  const requestTimeoutMinutes =
+    typeof ov.requestTimeoutMinutes === "number" && Number.isFinite(ov.requestTimeoutMinutes)
+      ? Math.max(1, Math.min(1440, Math.floor(ov.requestTimeoutMinutes)))
+      : fallback.requestTimeoutMinutes
+  const customHeaders = ov.customHeaders
+  // Streaming is a per-preset preference. Never inherit it from the currently
+  // active fallback preset, or a newly selected provider would silently adopt
+  // the previous provider's disabled state. Missing means legacy/default on.
+  const streamingEnabled = ov.streamingEnabled
+  const streamingConfig = streamingEnabled === undefined ? {} : { streamingEnabled }
 
   if (preset.provider === "custom") {
     return {
@@ -51,7 +64,11 @@ export function resolveConfig(
       maxContextSize,
       apiMode: ov.apiMode ?? preset.apiMode ?? "chat_completions",
       reasoning,
+      ingestReasoning,
       localCliIsolation: false,
+      requestTimeoutMinutes,
+      customHeaders,
+      ...streamingConfig,
     }
   }
 
@@ -64,7 +81,11 @@ export function resolveConfig(
       customEndpoint: fallback.customEndpoint,
       maxContextSize,
       reasoning,
+      ingestReasoning,
       localCliIsolation: false,
+      requestTimeoutMinutes,
+      customHeaders,
+      ...streamingConfig,
     }
   }
 
@@ -79,7 +100,11 @@ export function resolveConfig(
       azureModelFamily: ov.azureModelFamily ?? preset.azureModelFamily ?? "auto",
       maxContextSize,
       reasoning,
+      ingestReasoning,
       localCliIsolation: false,
+      requestTimeoutMinutes,
+      customHeaders,
+      ...streamingConfig,
     }
   }
 
@@ -94,8 +119,11 @@ export function resolveConfig(
       customEndpoint: fallback.customEndpoint,
       maxContextSize,
       reasoning,
+      ingestReasoning,
       localCliIsolation,
       codexCliTimeoutMinutes: preset.provider === "codex-cli" ? codexCliTimeoutMinutes : undefined,
+      requestTimeoutMinutes,
+      ...streamingConfig,
     }
   }
 
@@ -110,6 +138,10 @@ export function resolveConfig(
     customEndpoint: fallback.customEndpoint,
     maxContextSize,
     reasoning,
+    ingestReasoning,
     localCliIsolation: false,
+    requestTimeoutMinutes,
+    customHeaders,
+    ...streamingConfig,
   }
 }

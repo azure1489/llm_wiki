@@ -19,6 +19,9 @@ import { describe, it, expect } from "vitest"
 import {
   buildAnthropicUrl,
   getProviderConfig,
+  parseAnthropicResponse,
+  parseGoogleResponse,
+  parseOpenAiResponse,
   supportsImageInput,
   type ChatMessage,
   type ContentBlock,
@@ -39,6 +42,52 @@ function mkConfig(over: Partial<LlmConfig>): LlmConfig {
     ...over,
   }
 }
+
+describe("non-streaming provider configuration", () => {
+  it("disables streaming on OpenAI and Anthropic request bodies", () => {
+    const messages: ChatMessage[] = [{ role: "user", content: "hello" }]
+    const openai = getProviderConfig(mkConfig({ streamingEnabled: false }))
+    const anthropic = getProviderConfig(mkConfig({
+      provider: "anthropic",
+      model: "claude-3-5-sonnet-latest",
+      streamingEnabled: false,
+    }))
+
+    expect(openai.streaming).toBe(false)
+    expect(openai.buildBody(messages)).toMatchObject({ stream: false })
+    expect(anthropic.streaming).toBe(false)
+    expect(anthropic.buildBody(messages)).toMatchObject({ stream: false })
+  })
+
+  it("uses Gemini generateContent instead of the SSE endpoint", () => {
+    const provider = getProviderConfig(mkConfig({
+      provider: "google",
+      model: "gemini-2.5-flash",
+      streamingEnabled: false,
+    }))
+
+    expect(provider.url).toContain(":generateContent")
+    expect(provider.url).not.toContain("streamGenerateContent")
+  })
+
+  it("extracts complete response text for each HTTP wire", () => {
+    expect(parseOpenAiResponse({ choices: [{ message: { content: "openai" } }] })).toBe("openai")
+    expect(parseAnthropicResponse({ content: [{ type: "text", text: "anthropic" }] })).toBe("anthropic")
+    expect(parseGoogleResponse({
+      candidates: [{ content: { parts: [
+        { text: "hidden", thought: true },
+        { text: "google" },
+      ] } }],
+    })).toBe("google")
+  })
+
+  it("keeps streaming enabled for legacy configs without the new field", () => {
+    const provider = getProviderConfig(mkConfig({}))
+    expect(provider.streaming).toBe(true)
+    expect(provider.buildBody([{ role: "user", content: "hello" }]))
+      .toMatchObject({ stream: true })
+  })
+})
 
 function visionMessage(): ChatMessage {
   const blocks: ContentBlock[] = [
@@ -572,7 +621,7 @@ describe("reasoning controls", () => {
     expect(body.reasoning_effort).toBe("high")
   })
 
-  it("does not send an undocumented DeepSeek max_reasoning_tokens field", () => {
+  it("omits unsupported custom budgets on DeepSeek V4", () => {
     const cfg = mkConfig({
       provider: "custom",
       model: "deepseek-v4-pro",
@@ -584,7 +633,7 @@ describe("reasoning controls", () => {
       { reasoning: { mode: "custom", budgetTokens: 2048 } },
     ) as Record<string, unknown>
 
-    expect(body.thinking).toEqual({ type: "enabled" })
+    expect(body.thinking).toBeUndefined()
     expect(body.max_reasoning_tokens).toBeUndefined()
   })
 
@@ -695,7 +744,7 @@ describe("reasoning controls", () => {
     expect(body.messages).toEqual([{ role: "user", content: "Hi" }])
   })
 
-  it("disables Qwen3 thinking on OpenAI-compatible local endpoints", () => {
+  it("does not infer Qwen private parameters on generic custom endpoints", () => {
     const cfg = mkConfig({
       provider: "custom",
       model: "Qwen3.5-122B",
@@ -707,7 +756,7 @@ describe("reasoning controls", () => {
       { reasoning: { mode: "off" } },
     ) as Record<string, unknown>
 
-    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false })
+    expect(body.chat_template_kwargs).toBeUndefined()
   })
 
   it("strips temperature for Kimi/Moonshot OpenAI-compatible endpoints", () => {
@@ -758,14 +807,36 @@ describe("reasoning controls", () => {
     expect(body.temperature).toBeUndefined()
   })
 
-  it("maps Gemini reasoning off to thinkingBudget 0", () => {
+  it("omits unsupported reasoning off for Gemini 2.5 Pro", () => {
     const cfg = mkConfig({ provider: "google", model: "gemini-2.5-pro" })
     const body = getProviderConfig(cfg).buildBody(
       [{ role: "user", content: "hi" }],
       { reasoning: { mode: "off" } },
     ) as { generationConfig?: Record<string, unknown> }
 
-    expect(body.generationConfig?.thinkingConfig).toEqual({ thinkingBudget: 0 })
+    expect(body.generationConfig?.thinkingConfig).toBeUndefined()
+  })
+
+  it("uses adaptive thinking and effort for Claude 4.7+", () => {
+    const cfg = mkConfig({ provider: "anthropic", model: "claude-opus-4-7" })
+    const body = getProviderConfig(cfg).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "high" }, temperature: 0.1 },
+    ) as Record<string, unknown>
+
+    expect(body.thinking).toEqual({ type: "adaptive" })
+    expect(body.output_config).toEqual({ effort: "high" })
+    expect(body.temperature).toBeUndefined()
+  })
+
+  it("uses thinkingLevel rather than token budgets for Gemini 3", () => {
+    const cfg = mkConfig({ provider: "google", model: "gemini-3-pro-preview" })
+    const body = getProviderConfig(cfg).buildBody(
+      [{ role: "user", content: "hi" }],
+      { reasoning: { mode: "medium" } },
+    ) as { generationConfig?: Record<string, unknown> }
+
+    expect(body.generationConfig?.thinkingConfig).toEqual({ thinkingLevel: "medium" })
   })
 
   it("maps Ollama reasoning off to reasoning_effort none (stops thinking-runaway empty content)", () => {

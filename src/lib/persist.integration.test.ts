@@ -268,6 +268,45 @@ describe("chat persistence — round-trip (new format)", () => {
     expect(loaded.messages[0].images).toBeUndefined()
   })
 
+  it("does not persist Agent rollback snapshots", async () => {
+    const convs = [makeConv("c1", "Agent activity")]
+    const msg: DisplayMessage = {
+      ...makeMsg("m1", "c1", "done"),
+      agentFileChanges: [{
+        id: "run:file",
+        path: `${tmp.path}/agent-workspace/file.md`,
+        tool: "workspace.write_file",
+        operation: "modified",
+        additions: 1,
+        deletions: 1,
+        diff: "-before\n+after",
+        timestamp: 1,
+        beforeContent: "before",
+        afterContent: "after",
+      }],
+    }
+
+    await saveChatHistory(tmp.path, convs, [msg])
+    const raw = await readFileRaw(`${tmp.path}/.llm-wiki/chats/c1.json`)
+    expect(raw).not.toContain("beforeContent")
+    expect(raw).not.toContain("afterContent")
+    expect(raw).toContain("-before\\n+after")
+  })
+
+  it("persists user-message context file attachments", async () => {
+    const convs = [makeConv("c1", "Context files")]
+    const msg: DisplayMessage = {
+      ...makeMsg("m1", "c1", "summarize this"),
+      contextFiles: [`${tmp.path}/wiki/overview.md`],
+    }
+
+    await saveChatHistory(tmp.path, convs, [msg])
+    const loaded = await loadChatHistory(tmp.path)
+    expect(loaded.messages[0].contextFiles).toEqual([
+      `${tmp.path}/wiki/overview.md`,
+    ])
+  })
+
   it("caps each conversation's persisted messages at 100 (oldest dropped)", async () => {
     const convs = [makeConv("c1")]
     const msgs = Array.from({ length: 150 }, (_, i) =>
@@ -287,15 +326,40 @@ describe("chat persistence — round-trip (new format)", () => {
   })
 
   it("round-trips chat search preferences", async () => {
-    await saveChatPreferences(tmp.path, { useWebSearch: true, useAnyTxtSearch: false, agentMode: "deep" })
+    await saveChatPreferences(tmp.path, {
+      useWebSearch: true,
+      useAnyTxtSearch: false,
+      agentMode: "deep",
+      retrievalMode: "smart",
+      selectedSkills: ["reviewer", "illustrator"],
+      disabledSkills: ["legacy"],
+    })
     await expect(loadChatPreferences(tmp.path)).resolves.toEqual({
       useWebSearch: true,
       useAnyTxtSearch: false,
       agentMode: "deep",
+      retrievalMode: "smart",
+      selectedSkills: ["reviewer", "illustrator"],
+      disabledSkills: ["legacy"],
     })
 
     const raw = await readFileRaw(`${tmp.path}/.llm-wiki/chat-preferences.json`)
     expect(raw).toContain('"useWebSearch": true')
+    expect(raw).toContain('"retrievalMode": "smart"')
+  })
+
+  it("round-trips faithful source retrieval preference", async () => {
+    await saveChatPreferences(tmp.path, {
+      useWebSearch: false,
+      useAnyTxtSearch: false,
+      agentMode: "standard",
+      retrievalMode: "faithful",
+      selectedSkills: [],
+      disabledSkills: [],
+    })
+
+    const loaded = await loadChatPreferences(tmp.path)
+    expect(loaded.retrievalMode).toBe("faithful")
   })
 
   it("defaults chat search preferences to off when no file exists", async () => {
@@ -303,6 +367,9 @@ describe("chat persistence — round-trip (new format)", () => {
       useWebSearch: false,
       useAnyTxtSearch: false,
       agentMode: "standard",
+      retrievalMode: "standard",
+      selectedSkills: [],
+      disabledSkills: [],
     })
   })
 
@@ -318,6 +385,42 @@ describe("chat persistence — round-trip (new format)", () => {
     )
     const loaded = await loadChatHistory(tmp.path)
     expect(loaded.conversations).toHaveLength(2)
+    expect(loaded.messages).toHaveLength(1)
+  })
+
+  it("recovers conversations from orphan chat files when conversation index was overwritten empty", async () => {
+    await writeFileRaw(`${tmp.path}/.llm-wiki/conversations.json`, "[]")
+    await writeFileRaw(
+      `${tmp.path}/.llm-wiki/chats/c1.json`,
+      JSON.stringify([
+        makeMsg("m1", "c1", "First recovered question"),
+        { ...makeMsg("m2", "c1", "answer"), role: "assistant" },
+      ]),
+    )
+    await writeFileRaw(
+      `${tmp.path}/.llm-wiki/chats/c2.json`,
+      JSON.stringify([makeMsg("m3", "c2", "Second recovered question")]),
+    )
+
+    const loaded = await loadChatHistory(tmp.path)
+
+    expect(loaded.conversations.map((conversation) => conversation.id).sort()).toEqual(["c1", "c2"])
+    expect(loaded.conversations.find((conversation) => conversation.id === "c1")?.title).toBe(
+      "First recovered question",
+    )
+    expect(loaded.messages).toHaveLength(3)
+  })
+
+  it("recovers conversations from orphan chat files when conversation index is missing", async () => {
+    await writeFileRaw(
+      `${tmp.path}/.llm-wiki/chats/c1.json`,
+      JSON.stringify([makeMsg("m1", "c1", "Recovered without index")]),
+    )
+
+    const loaded = await loadChatHistory(tmp.path)
+
+    expect(loaded.conversations).toHaveLength(1)
+    expect(loaded.conversations[0].id).toBe("c1")
     expect(loaded.messages).toHaveLength(1)
   })
 

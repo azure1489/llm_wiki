@@ -93,7 +93,7 @@ describe("provider connection tests", () => {
       expect.any(Array),
       expect.any(Object),
       undefined,
-      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
+      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "auto" } },
     )
   })
 
@@ -124,7 +124,7 @@ describe("provider connection tests", () => {
     ["Codex CLI", "codex-cli", "functional", false],
     ["Codex CLI", "codex-cli", "functional", undefined],
   ] as const)(
-    "isolates local CLI configuration during %s %s tests",
+    "preserves local CLI isolation during %s %s tests",
     async (_label, provider, kind, initialIsolation) => {
       streamChatMock.mockImplementationOnce(async (_cfg, _messages, callbacks) => {
         callbacks.onToken(kind === "functional" ? "LLM_WIKI_TEST_OK" : "OK")
@@ -142,11 +142,11 @@ describe("provider connection tests", () => {
 
       expect(result.ok).toBe(true)
       expect(streamChatMock).toHaveBeenCalledWith(
-        expect.objectContaining({ provider, localCliIsolation: true }),
+        cfg,
         expect.any(Array),
         expect.any(Object),
         undefined,
-        { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
+        { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "auto" } },
       )
       expect(cfg.localCliIsolation).toBe(initialIsolation)
     },
@@ -166,7 +166,7 @@ describe("provider connection tests", () => {
       expect.any(Array),
       expect.any(Object),
       undefined,
-      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
+      { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "auto" } },
     )
   })
 })

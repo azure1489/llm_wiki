@@ -64,6 +64,58 @@ describe("mergePageContent — fast paths", () => {
   })
 })
 
+describe("mergePageContent — corrected single-source replacement", () => {
+  it("replaces only the body while preserving metadata, arrays, and backup", async () => {
+    const existing = PAGE(
+      'type: entity\ntitle: Stable title\ncreated: 2025-01-01\nupdated: 2025-01-02\nsources: ["doc.pdf"]\ntags: [manual]\nrelated: [kept-link]',
+      "obsolete source wording plus a manual-era body",
+    )
+    const incoming = PAGE(
+      'type: concept\ntitle: Changed title\ncreated: 2026-01-01\nsources: ["doc.pdf"]\ntags: [generated]\nrelated: [new-link]',
+      "corrected source wording",
+    )
+    const merger = vi.fn()
+    const backup = vi.fn().mockResolvedValue(undefined)
+
+    const out = await mergePageContent(incoming, existing, merger, {
+      ...baseOpts,
+      replaceExistingBody: true,
+      backup,
+    })
+
+    expect(out).toContain("corrected source wording")
+    expect(out).not.toContain("obsolete source wording")
+    expect(out).toContain("type: entity")
+    expect(out).toContain("title: Stable title")
+    expect(out).toContain("created: 2025-01-01")
+    expect(out).toContain("updated: 2026-04-30")
+    expect(out).toMatch(/tags:\s*\[\s*"manual",\s*"generated"\s*\]/)
+    expect(out).toMatch(/related:\s*\[\s*"kept-link",\s*"new-link"\s*\]/)
+    expect(backup).toHaveBeenCalledWith(existing)
+    expect(merger).not.toHaveBeenCalled()
+  })
+
+  it("keeps normal merge behavior for a page with another source", async () => {
+    const existing = PAGE(
+      'type: entity\ntitle: Shared\nsources: ["doc.pdf", "other.pdf"]',
+      "other source contribution",
+    )
+    const incoming = PAGE(
+      'type: entity\ntitle: Shared\nsources: ["doc.pdf"]',
+      "corrected doc contribution",
+    )
+    const merger = vi.fn().mockResolvedValue(PAGE(
+      'type: entity\ntitle: Shared\nsources: ["doc.pdf", "other.pdf"]',
+      "other source contribution and corrected doc contribution retained together",
+    ))
+
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+    expect(merger).toHaveBeenCalledOnce()
+    expect(out).toContain("other source contribution")
+    expect(out).toContain("corrected doc contribution")
+  })
+})
+
 // ──────────────────────────────────────────────────────────────────
 // LLM merge happy path
 // ──────────────────────────────────────────────────────────────────
@@ -129,6 +181,58 @@ describe("mergePageContent — LLM merge", () => {
     const out = await mergePageContent(incoming, existing, merger, baseOpts)
     expect(out).toContain("type: entity")
     expect(out).not.toContain("type: concept")
+  })
+
+  it("strips directory prefixes from merged body wikilinks only", async () => {
+    const existing = PAGE(
+      "type: entity\ntitle: Foo",
+      "Existing notes link to [[clients/foo-overview]] and contain enough detail for merging.",
+    )
+    const incoming = PAGE(
+      "type: entity\ntitle: Foo",
+      "Incoming notes add a second detailed observation about the same subject.",
+    )
+    const mergedBody = [
+      "Existing and incoming notes are retained with additional context.",
+      "See [[clients/foo-overview]], [[concepts/bar#Details|Bar details]], and [[windows\\baz]].",
+      "Keep the ordinary path clients/foo-overview unchanged.",
+      "Keep the embed ![[media/charts/plot.png]] unchanged.",
+      "Keep inline code `[[examples/inline-link]]` unchanged.",
+      "Keep multi-backtick code ``[[examples/multi-backtick]]`` unchanged.",
+      "```md",
+      "[[examples/fenced-link]]",
+      "```not-a-closing-fence",
+      "[[examples/still-fenced-link]]",
+      "```",
+      "~~~md",
+      "[[examples/tilde-fenced-link]]",
+      "~~~",
+      "    [[examples/indented-code-link]]",
+      "Keep escaped \\[[examples/escaped-link]] unchanged.",
+      "Keep URI-like [[https://example.com/wiki/page]] targets unchanged.",
+      "Keep attachment [[attachments/report.pdf]] targets unchanged.",
+    ].join("\n")
+    const merger = vi.fn().mockResolvedValue(
+      PAGE("type: entity\ntitle: Foo", mergedBody),
+    )
+
+    const out = await mergePageContent(incoming, existing, merger, baseOpts)
+
+    expect(out).toContain("[[foo-overview]]")
+    expect(out).toContain("[[bar#Details|Bar details]]")
+    expect(out).toContain("[[baz]]")
+    expect(out).not.toContain("[[clients/foo-overview]]")
+    expect(out).toContain("ordinary path clients/foo-overview unchanged")
+    expect(out).toContain("![[media/charts/plot.png]]")
+    expect(out).toContain("`[[examples/inline-link]]`")
+    expect(out).toContain("``[[examples/multi-backtick]]``")
+    expect(out).toContain("[[examples/fenced-link]]")
+    expect(out).toContain("[[examples/still-fenced-link]]")
+    expect(out).toContain("[[examples/tilde-fenced-link]]")
+    expect(out).toContain("    [[examples/indented-code-link]]")
+    expect(out).toContain("\\[[examples/escaped-link]]")
+    expect(out).toContain("[[https://example.com/wiki/page]]")
+    expect(out).toContain("[[attachments/report.pdf]]")
   })
 })
 
