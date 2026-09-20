@@ -448,10 +448,12 @@ describe("source import skip reporting", () => {
       watchConfig(),
     )
 
-    expect(result.imported).toEqual(["/project/raw/sources/notes.md"])
+    expect(result.imported).toEqual([
+      "/project/raw/sources/photo.png",
+      "/project/raw/sources/notes.md",
+    ])
     expect(result.skipped).toEqual([
       { name: "script.py", reason: "unsupported-type" },
-      { name: "photo.png", reason: "unsupported-type" },
     ])
   })
 

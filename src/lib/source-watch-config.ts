@@ -25,6 +25,10 @@ export const SOURCE_WATCH_FILE_TYPE_GROUPS = [
     id: "data",
     extensions: ["json", "yaml", "yml", "xml"],
   },
+  {
+    id: "images",
+    extensions: ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "avif", "heic", "heif"],
+  },
 ]
 
 function normalizeExtensions(values: readonly string[] | undefined): string[] {
