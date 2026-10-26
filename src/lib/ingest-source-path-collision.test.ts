@@ -14,11 +14,15 @@ vi.mock("@/commands/fs", () => realFs)
 let sourceMarkers: string[] = []
 let failLongChunksOnce = new Set<number>()
 let extraReviewResponse = ""
+let generationPrefix = ""
 let generationSuffix = ""
 let truncatedRepairResponse = ""
 let abortDuringReview: AbortController | null = null
 let interactiveGenerationOverride = ""
 let mergeRequestCount = 0
+let truncateGenerationOnce = false
+let emptyGenerationOnce = false
+let confirmResumeCompleteOnce = false
 
 vi.mock("./llm-client", () => ({
   streamChat: vi.fn(async (_cfg, messages, cb) => {
@@ -40,7 +44,7 @@ vi.mock("./llm-client", () => ({
         return
       }
       cb.onToken([
-        "---FILE: wiki/sources/config.md---",
+        `---FILE: ${String(messages.at(-1)?.content).match(/exact path: \*\*([^*]+)\*\*/)?.[1] ?? "wiki/sources/config.md"}---`,
         "---",
         'type: "source"',
         'title: "Source: config.yaml"',
@@ -103,11 +107,24 @@ vi.mock("./llm-client", () => ({
       return
     }
 
+    if (emptyGenerationOnce) {
+      emptyGenerationOnce = false
+      cb.onDone({ finishReason: "stop", truncated: false })
+      return
+    }
+    if (confirmResumeCompleteOnce) {
+      confirmResumeCompleteOnce = false
+      cb.onToken("---RESUME COMPLETE---")
+      cb.onDone({ finishReason: "stop", truncated: false })
+      return
+    }
+
     const marker = sourceMarkers.shift() ?? "unknown project"
     const targetPath = targetMatch[1]
     const sourceIdentity =
       systemPrompt.match(/original source file is:\s*\*\*([^*]+)\*\*/i)?.[1] ?? "config.yaml"
     cb.onToken([
+      generationPrefix,
       `---FILE: ${targetPath}---`,
       "---",
       `title: "Source: ${sourceIdentity}"`,
@@ -120,7 +137,12 @@ vi.mock("./llm-client", () => ({
       "---END FILE---",
       generationSuffix,
     ].join("\n"))
-    cb.onDone()
+    if (truncateGenerationOnce) {
+      truncateGenerationOnce = false
+      cb.onDone({ finishReason: "length", truncated: true })
+    } else {
+      cb.onDone({ finishReason: "stop", truncated: false })
+    }
   }),
 }))
 
@@ -148,11 +170,15 @@ describe("autoIngest source summary paths", () => {
     sourceMarkers = []
     failLongChunksOnce = new Set()
     extraReviewResponse = ""
+    generationPrefix = ""
     generationSuffix = ""
     truncatedRepairResponse = ""
     abortDuringReview = null
     interactiveGenerationOverride = ""
     mergeRequestCount = 0
+    truncateGenerationOnce = false
+    emptyGenerationOnce = false
+    confirmResumeCompleteOnce = false
     mockStreamChat.mockClear()
     mockParseWithMineru.mockReset()
     tmp = await createTempProject("same-basename-sources")
@@ -236,6 +262,141 @@ describe("autoIngest source summary paths", () => {
     const content = buildFallbackSourceSummary("long.md", analysis, "2026-07-11")
     expect(content).toContain(analysis)
     expect(content).toContain("-end")
+  })
+
+  it.each(["before", "after"])("preserves the exact summary when a cited work appears %s it", async (order) => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["correct source summary"]
+    const citationPath = "wiki/sources/the-bitter-lesson.md"
+    const existingCitation = "# Existing cited work\n\nKeep this page unchanged."
+    await writeFileRaw(`${tmp.path}/${citationPath}`, existingCitation)
+    const citationBlock = `---FILE: ${citationPath}---\n# Wrong cited-work summary\n---END FILE---`
+    if (order === "before") generationPrefix = citationBlock
+    else generationSuffix = citationBlock
+
+    const written = await autoIngest(tmp.path, `${tmp.path}/raw/sources/project-a/config.yaml`, useWikiStore.getState().llmConfig)
+    const summaryPath = `wiki/sources/${sourceSummarySlugFromIdentity("project-a/config.yaml")}.md`
+    const content = await fs.readFile(`${tmp.path}/${summaryPath}`, "utf8")
+
+    expect(content).toContain("correct source summary")
+    expect(content).not.toContain("Wrong cited-work summary")
+    expect(written.filter((p) => p === summaryPath)).toHaveLength(1)
+    expect(await fs.readFile(`${tmp.path}/${citationPath}`, "utf8")).toBe(existingCitation)
+    expect(await fs.readFile(`${tmp.path}/.llm-wiki/ingest-warnings.log`, "utf8")).toContain(`Ignored unexpected source summary "${citationPath}"`)
+  })
+
+  it("preserves the first successful summary when its exact path is emitted twice", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["first correct summary"]
+    const summaryPath = `wiki/sources/${sourceSummarySlugFromIdentity("project-a/config.yaml")}.md`
+    generationSuffix = `---FILE: ${summaryPath}---\n# Later incorrect replacement\n---END FILE---`
+
+    await autoIngest(tmp.path, `${tmp.path}/raw/sources/project-a/config.yaml`, useWikiStore.getState().llmConfig)
+
+    const content = await fs.readFile(`${tmp.path}/${summaryPath}`, "utf8")
+    expect(content).toContain("first correct summary")
+    expect(content).not.toContain("Later incorrect replacement")
+    expect(await fs.readFile(`${tmp.path}/.llm-wiki/ingest-warnings.log`, "utf8")).toContain("Ignored duplicate source summary")
+  })
+
+  it("prevents schema routing from overwriting an already-written source summary", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["correct source summary"]
+    await writeFileRaw(`${tmp.path}/schema.md`, "## Page Types\n| source | wiki/sources/ | Source summaries |")
+    const slug = sourceSummarySlugFromIdentity("project-a/config.yaml")
+    generationSuffix = `---FILE: wiki/concepts/${slug}.md---\n---\ntype: source\n---\n# Wrong routed replacement\n---END FILE---`
+
+    await autoIngest(tmp.path, `${tmp.path}/raw/sources/project-a/config.yaml`, useWikiStore.getState().llmConfig)
+
+    expect(await fs.readFile(`${tmp.path}/wiki/sources/${slug}.md`, "utf8")).toContain("correct source summary")
+    expect(await fs.readFile(`${tmp.path}/.llm-wiki/ingest-warnings.log`, "utf8")).toContain("Ignored duplicate source summary")
+  })
+
+  it("does not repair an unexpected truncated source summary onto the current source", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["correct source summary"]
+    generationSuffix = "---FILE: wiki/sources/cited-work.md---\n# Incomplete cited work"
+    truncatedRepairResponse = "---FILE: wiki/sources/cited-work.md---\n# Wrong repair\n---END FILE---"
+
+    await autoIngest(tmp.path, `${tmp.path}/raw/sources/project-a/config.yaml`, useWikiStore.getState().llmConfig)
+
+    const summaryPath = `wiki/sources/${sourceSummarySlugFromIdentity("project-a/config.yaml")}.md`
+    expect(await fs.readFile(`${tmp.path}/${summaryPath}`, "utf8")).toContain("correct source summary")
+    await expect(fs.access(`${tmp.path}/wiki/sources/cited-work.md`)).rejects.toThrow()
+    expect(mockStreamChat.mock.calls.some(([, messages]) => String(messages[0]?.content).startsWith("You are repairing truncated wiki FILE blocks"))).toBe(false)
+  })
+
+  it("protects the source summary while repairing a different truncated page", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["correct source summary"]
+    const summaryPath = `wiki/sources/${sourceSummarySlugFromIdentity("project-a/config.yaml")}.md`
+    generationSuffix = "---FILE: wiki/concepts/recovered.md---\n# Incomplete concept"
+    truncatedRepairResponse = [
+      "---FILE: wiki/concepts/recovered.md---\n# Recovered concept\n---END FILE---",
+      `---FILE: ${summaryPath}---\n# Wrong replacement\n---END FILE---`,
+      "---FILE: wiki/sources/cited-work.md---\n# Wrong cited work\n---END FILE---",
+    ].join("\n")
+
+    const written = await autoIngest(tmp.path, `${tmp.path}/raw/sources/project-a/config.yaml`, useWikiStore.getState().llmConfig)
+
+    expect(written).toContain("wiki/concepts/recovered.md")
+    expect(await fs.readFile(`${tmp.path}/${summaryPath}`, "utf8")).toContain("correct source summary")
+    await expect(fs.access(`${tmp.path}/wiki/sources/cited-work.md`)).rejects.toThrow()
+  })
+
+  it("rejects additional and duplicate source summaries during interactive writes", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    useChatStore.getState().createConversation()
+    const summaryPath = `wiki/sources/${sourceSummarySlugFromIdentity("project-a/config.yaml")}.md`
+    interactiveGenerationOverride = [
+      "---FILE: wiki/sources/cited-work.md---\n# Wrong cited work\n---END FILE---",
+      `---FILE: ${summaryPath}---\n# Correct interactive summary\n---END FILE---`,
+      `---FILE: ${summaryPath}---\n# Wrong duplicate\n---END FILE---`,
+    ].join("\n")
+    useChatStore.setState({ ingestSource: `${tmp.path}/raw/sources/project-a/config.yaml` })
+
+    const written = await executeIngestWrites(tmp.path, useWikiStore.getState().llmConfig)
+
+    expect(written).toEqual([`${tmp.path}/${summaryPath}`])
+    expect(await fs.readFile(written[0], "utf8")).toContain("Correct interactive summary")
+    await expect(fs.access(`${tmp.path}/wiki/sources/cited-work.md`)).rejects.toThrow()
+    const warnings = await fs.readFile(`${tmp.path}/.llm-wiki/ingest-warnings.log`, "utf8")
+    expect(warnings).toContain("Ignored unexpected source summary")
+    expect(warnings).toContain("Ignored duplicate source summary")
+    expect(useChatStore.getState().messages.some((m) => m.role === "system" && m.content.includes("Ingest warnings:"))).toBe(true)
+  })
+
+  it.each([
+    `${"中文".repeat(35)}.md`,
+    `${"资".repeat(30)}/${"文".repeat(70)}.md`,
+  ])("ingests a long CJK source into a filesystem-safe summary: %s", async (identity) => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["long source ingested"]
+    await writeFileRaw(`${tmp.path}/raw/sources/${identity}`, "Long CJK filename source.\n")
+
+    const written = await autoIngest(tmp.path, `${tmp.path}/raw/sources/${identity}`, useWikiStore.getState().llmConfig)
+    const summaryPath = `wiki/sources/${sourceSummarySlugFromIdentity(identity)}.md`
+
+    expect(written).toContain(summaryPath)
+    expect(await fs.readFile(`${tmp.path}/${summaryPath}`, "utf8")).toContain("long source ingested")
+    expect(await fs.readFile(`${tmp.path}/${summaryPath}`, "utf8")).toContain(identity)
+    expect(useActivityStore.getState().items.some((item) => item.status === "error")).toBe(false)
+  })
+
+  it("keeps an existing portable CJK summary at its original path", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    const stem = "中文".repeat(35)
+    const identity = `${stem}.md`
+    const oldSummaryPath = `${tmp.path}/wiki/sources/${stem}.md`
+    sourceMarkers = ["regenerated long source"]
+    await writeFileRaw(`${tmp.path}/raw/sources/${identity}`, "Updated source.\n")
+    await writeFileRaw(oldSummaryPath, `---\nsources: ["${identity}"]\n---\n# Previous summary`)
+
+    await autoIngest(tmp.path, `${tmp.path}/raw/sources/${identity}`, useWikiStore.getState().llmConfig)
+
+    const summaryPath = `${tmp.path}/wiki/sources/${sourceSummarySlugFromIdentity(identity)}.md`
+    expect(summaryPath).toBe(oldSummaryPath)
+    expect(await fs.readFile(summaryPath, "utf8")).toContain("regenerated long source")
   })
 
   it("keeps distinct source summaries for same-basename files in different source subdirectories", async () => {
@@ -690,6 +851,94 @@ describe("autoIngest source summary paths", () => {
     ).toBe(true)
   })
 
+  it("auto-routes a generated typed page into its schema directory", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["project-a config"]
+    generationSuffix = [
+      "",
+      "---FILE: wiki/concepts/outcome.md---",
+      "---",
+      "type: goal",
+      'title: "Outcome"',
+      'sources: ["project-a/config.yaml"]',
+      "---",
+      "# Outcome",
+      "---END FILE---",
+    ].join("\n")
+
+    const written = await autoIngest(
+      tmp.path,
+      `${tmp.path}/raw/sources/project-a/config.yaml`,
+      useWikiStore.getState().llmConfig,
+    )
+
+    expect(written).toContain("wiki/goals/outcome.md")
+    expect(written).not.toContain("wiki/concepts/outcome.md")
+    await expect(fs.readFile(`${tmp.path}/wiki/goals/outcome.md`, "utf8"))
+      .resolves.toContain("# Outcome")
+  })
+
+  it("persists completed files and resumes after a truncated generation", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    const sourcePath = `${tmp.path}/raw/sources/project-a/config.yaml`
+    sourceMarkers = ["first attempt", "resumed attempt"]
+    generationSuffix = [
+      "",
+      "---FILE: wiki/goals/preserved.md---",
+      "---",
+      "type: goal",
+      'title: "Preserved"',
+      'sources: ["project-a/config.yaml"]',
+      "---",
+      "# Preserved",
+      "---END FILE---",
+    ].join("\n")
+    truncateGenerationOnce = true
+
+    await expect(autoIngest(
+      tmp.path,
+      sourcePath,
+      useWikiStore.getState().llmConfig,
+    )).rejects.toThrow("generation reached its output limit")
+    await expect(fs.readFile(`${tmp.path}/wiki/goals/preserved.md`, "utf8"))
+      .resolves.toContain("# Preserved")
+
+    emptyGenerationOnce = true
+    await expect(autoIngest(tmp.path, sourcePath, useWikiStore.getState().llmConfig))
+      .rejects.toThrow("resume returned no complete wiki file")
+    await expect(fs.readdir(`${tmp.path}/.llm-wiki/ingest-generation`))
+      .resolves.toHaveLength(1)
+
+    confirmResumeCompleteOnce = true
+    await autoIngest(tmp.path, sourcePath, useWikiStore.getState().llmConfig)
+
+    const generationCalls = mockStreamChat.mock.calls.filter(([, messages]) =>
+      String(messages[0]?.content ?? "").includes("## What to generate"),
+    )
+    const resumedPrompt = String(generationCalls[generationCalls.length - 1]?.[1]?.[1]?.content ?? "")
+    expect(resumedPrompt)
+      .toContain("## Resume checkpoint")
+    expect(resumedPrompt).toContain("wiki/goals/preserved.md")
+    const checkpointFiles = await fs.readdir(`${tmp.path}/.llm-wiki/ingest-generation`)
+    expect(checkpointFiles).toHaveLength(0)
+  })
+
+  it("preserves a completed source summary when a resumed generation emits it again", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    sourceMarkers = ["first complete summary", "wrong resumed replacement"]
+    truncateGenerationOnce = true
+    const sourcePath = `${tmp.path}/raw/sources/project-a/config.yaml`
+    await expect(autoIngest(tmp.path, sourcePath, useWikiStore.getState().llmConfig)).rejects.toThrow("generation reached its output limit")
+
+    generationSuffix = "---FILE: wiki/concepts/remaining.md---\n# Remaining concept\n---END FILE---"
+    await autoIngest(tmp.path, sourcePath, useWikiStore.getState().llmConfig)
+
+    const summaryPath = `wiki/sources/${sourceSummarySlugFromIdentity("project-a/config.yaml")}.md`
+    const content = await fs.readFile(`${tmp.path}/${summaryPath}`, "utf8")
+    expect(content).toContain("first complete summary")
+    expect(content).not.toContain("wrong resumed replacement")
+  })
+
   it("rejects an ingest when a truncated FILE block cannot be repaired", async () => {
     if (!tmp) throw new Error("missing temp project")
     sourceMarkers = ["project-a config"]
@@ -830,7 +1079,7 @@ describe("autoIngest source summary paths", () => {
     ).toBe(false)
   })
 
-  it("canonicalizes interactive source summary paths and sources frontmatter", async () => {
+  it("canonicalizes interactive source frontmatter at the requested summary path", async () => {
     if (!tmp) throw new Error("missing temp project")
 
     const conversationId = "conv-interactive-source"
@@ -891,5 +1140,25 @@ describe("autoIngest source summary paths", () => {
 
     expect(written).toEqual([])
     await expect(fs.access(path.join(tmp.path, "escape.md"))).rejects.toThrow()
+  })
+
+  it("sanitizes malformed citation links in interactive writes", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    interactiveGenerationOverride = [
+      "---FILE: wiki/entities/citations.md---",
+      "---",
+      "type: entity",
+      "title: Citations",
+      "---",
+      "Evidence [[1]] and [[target|label].",
+      "---END FILE---",
+    ].join("\n")
+    useChatStore.setState({ ingestSource: null })
+
+    const written = await executeIngestWrites(tmp.path, useWikiStore.getState().llmConfig)
+
+    expect(written).toHaveLength(1)
+    const content = await fs.readFile(written[0], "utf8")
+    expect(content).toContain("Evidence [1] and [[target|label]].")
   })
 })

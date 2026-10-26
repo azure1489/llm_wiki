@@ -58,6 +58,8 @@ interface LlmConfig {
   streamingEnabled?: boolean
   /** Optional headers added to every HTTP request for this provider preset. */
   customHeaders?: Record<string, string>
+  /** Optional provider-specific fields merged into custom OpenAI-compatible request bodies. */
+  extraRequestBody?: Record<string, unknown>
 }
 
 export type SearchProvider =
@@ -185,9 +187,8 @@ interface EmbeddingConfig {
  * `concurrency` bounds parallel caption requests during ingest.
  * 30-image PDFs with sequential captioning at ~10s/image (a Qwen3
  * thinking model on consumer GPU) take 5 minutes. At concurrency=4
- * that drops to ~75s. Going wider than 8 typically just queues
- * behind a single-GPU server's batch slot, so we cap the slider
- * UI at a tasteful max in the settings view.
+ * that drops to ~75s. Higher values are available for hosted or
+ * multi-GPU endpoints that can sustain broader parallelism.
  */
 /**
  * Global outbound HTTP proxy. When `enabled` and `url` is a valid
@@ -350,6 +351,7 @@ export interface ProviderOverride {
   requestTimeoutMinutes?: number
   streamingEnabled?: boolean
   customHeaders?: Record<string, string>
+  extraRequestBody?: Record<string, unknown>
 }
 
 export type ProviderConfigs = Record<string, ProviderOverride>
@@ -408,6 +410,8 @@ interface WikiState {
    * This is transient navigation state and must not be persisted.
    */
   previewReturnView: Exclude<WikiState["activeView"], "wiki"> | null
+  previewBackStack: string[]
+  previewForwardStack: string[]
   /**
    * One-shot scroll target for the markdown preview. When the user
    * clicks an image in search results and chooses "jump to source",
@@ -441,6 +445,7 @@ interface WikiState {
   proxyConfig: ProxyConfig
   scheduledImportConfig: ScheduledImportConfig
   sourceWatchConfig: SourceWatchConfig
+  sourceWatchAllProjects: boolean
   mineruConfig: MineruConfig
   apiConfig: ApiConfig
   generalConfig: GeneralConfig
@@ -455,6 +460,8 @@ interface WikiState {
   openPathInPreview: (path: string) => void
   openFileInPreview: (path: string, content: string) => void
   closePreview: () => void
+  navigatePreviewBack: () => void
+  navigatePreviewForward: () => void
   setExternalPreview: (preview: ExternalPreview | null) => void
   setPendingScrollImageSrc: (src: string | null) => void
   setActiveView: (view: WikiState["activeView"]) => void
@@ -472,6 +479,7 @@ interface WikiState {
   setProxyConfig: (config: ProxyConfig) => void
   setScheduledImportConfig: (config: ScheduledImportConfig) => void
   setSourceWatchConfig: (config: SourceWatchConfig) => void
+  setSourceWatchAllProjects: (enabled: boolean) => void
   setMineruConfig: (config: MineruConfig) => void
   setApiConfig: (config: ApiConfig) => void
   setGeneralConfig: (config: GeneralConfig) => void
@@ -489,6 +497,8 @@ export const useWikiStore = create<WikiState>((set) => ({
   previewContentPath: null,
   externalPreview: null,
   previewReturnView: null,
+  previewBackStack: [],
+  previewForwardStack: [],
   pendingScrollImageSrc: null,
   activeView: "wiki",
   llmConfig: {
@@ -540,7 +550,17 @@ export const useWikiStore = create<WikiState>((set) => ({
   setProjectPathIndexFromTree: (tree) =>
     set({ projectPathIndex: buildProjectPathIndexFromTree(tree) }),
   setSelectedFile: (selectedFile) =>
-    set({ selectedFile, previewContentPath: null, externalPreview: null }),
+    set((state) => ({
+      selectedFile,
+      previewContentPath: null,
+      externalPreview: null,
+      previewBackStack: selectedFile && state.selectedFile && !state.externalPreview && selectedFile !== state.selectedFile
+        ? [...state.previewBackStack, state.selectedFile].slice(-50)
+        : selectedFile ? state.previewBackStack : [],
+      previewForwardStack: selectedFile && selectedFile !== state.selectedFile
+        ? []
+        : selectedFile ? state.previewForwardStack : [],
+    })),
   setFileContent: (fileContent) => set({ fileContent }),
   openPathInPreview: (selectedFile) =>
     set((state) => ({
@@ -550,6 +570,10 @@ export const useWikiStore = create<WikiState>((set) => ({
       activeView: "wiki",
       previewReturnView:
         state.activeView === "wiki" ? state.previewReturnView : state.activeView,
+      previewBackStack: state.selectedFile && !state.externalPreview && state.selectedFile !== selectedFile
+        ? [...state.previewBackStack, state.selectedFile].slice(-50)
+        : state.previewBackStack,
+      previewForwardStack: state.selectedFile !== selectedFile ? [] : state.previewForwardStack,
     })),
   openFileInPreview: (selectedFile, fileContent) =>
     set((state) => ({
@@ -560,6 +584,10 @@ export const useWikiStore = create<WikiState>((set) => ({
       activeView: "wiki",
       previewReturnView:
         state.activeView === "wiki" ? state.previewReturnView : state.activeView,
+      previewBackStack: state.selectedFile && !state.externalPreview && state.selectedFile !== selectedFile
+        ? [...state.previewBackStack, state.selectedFile].slice(-50)
+        : state.previewBackStack,
+      previewForwardStack: state.selectedFile !== selectedFile ? [] : state.previewForwardStack,
     })),
   closePreview: () =>
     set((state) => ({
@@ -569,7 +597,35 @@ export const useWikiStore = create<WikiState>((set) => ({
       externalPreview: null,
       activeView: state.previewReturnView ?? "wiki",
       previewReturnView: null,
+      previewBackStack: [],
+      previewForwardStack: [],
     })),
+  navigatePreviewBack: () =>
+    set((state) => {
+      const previous = state.previewBackStack[state.previewBackStack.length - 1]
+      if (!previous || !state.selectedFile) return state
+      return {
+        selectedFile: previous,
+        fileContent: "",
+        previewContentPath: null,
+        externalPreview: null,
+        previewBackStack: state.previewBackStack.slice(0, -1),
+        previewForwardStack: [...state.previewForwardStack, state.selectedFile].slice(-50),
+      }
+    }),
+  navigatePreviewForward: () =>
+    set((state) => {
+      const next = state.previewForwardStack[state.previewForwardStack.length - 1]
+      if (!next || !state.selectedFile) return state
+      return {
+        selectedFile: next,
+        fileContent: "",
+        previewContentPath: null,
+        externalPreview: null,
+        previewBackStack: [...state.previewBackStack, state.selectedFile].slice(-50),
+        previewForwardStack: state.previewForwardStack.slice(0, -1),
+      }
+    }),
   setExternalPreview: (externalPreview) => set({ externalPreview }),
   setPendingScrollImageSrc: (pendingScrollImageSrc) => set({ pendingScrollImageSrc }),
   setActiveView: (activeView) => set({ activeView, previewReturnView: null }),
@@ -632,6 +688,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   },
 
   sourceWatchConfig: DEFAULT_SOURCE_WATCH_CONFIG,
+  sourceWatchAllProjects: false,
   mineruConfig: {
     enabled: false,
     backend: "cloud",
@@ -682,6 +739,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   setProxyConfig: (proxyConfig) => set({ proxyConfig }),
   setScheduledImportConfig: (scheduledImportConfig) => set({ scheduledImportConfig }),
   setSourceWatchConfig: (sourceWatchConfig) => set({ sourceWatchConfig }),
+  setSourceWatchAllProjects: (sourceWatchAllProjects) => set({ sourceWatchAllProjects }),
   setMineruConfig: (mineruConfig) => set({ mineruConfig }),
   setApiConfig: (apiConfig) => set({ apiConfig }),
   setGeneralConfig: (generalConfig) => set({ generalConfig }),

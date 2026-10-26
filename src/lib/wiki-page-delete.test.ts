@@ -11,6 +11,8 @@ const mockRemovePageEmbedding = vi.fn<(projectPath: string, slug: string) => Pro
 const mockReadFile = vi.fn<(path: string) => Promise<string>>()
 const mockWriteFile = vi.fn<(path: string, content: string) => Promise<void>>()
 const mockListDirectory = vi.fn<(path: string) => Promise<unknown>>()
+const mockLoadReviewItems = vi.fn()
+const mockSaveReviewItems = vi.fn()
 
 vi.mock("@/commands/fs", () => ({
   deleteFile: (path: string) => mockDeleteFile(path),
@@ -19,9 +21,15 @@ vi.mock("@/commands/fs", () => ({
   listDirectory: (path: string) => mockListDirectory(path),
 }))
 
-vi.mock("@/lib/embedding", () => ({
+vi.mock("@/lib/embedding", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/embedding")>()),
   removePageEmbedding: (projectPath: string, slug: string) =>
     mockRemovePageEmbedding(projectPath, slug),
+}))
+
+vi.mock("@/lib/persist", () => ({
+  loadReviewItems: (...args: unknown[]) => mockLoadReviewItems(...args),
+  saveReviewItems: (...args: unknown[]) => mockSaveReviewItems(...args),
 }))
 
 import { cascadeDeleteWikiPage, cascadeDeleteWikiPagesWithRefs } from "./wiki-page-delete"
@@ -33,10 +41,14 @@ beforeEach(() => {
   mockReadFile.mockReset()
   mockWriteFile.mockReset()
   mockListDirectory.mockReset()
+  mockLoadReviewItems.mockReset()
+  mockSaveReviewItems.mockReset()
   // Default: both succeed silently.
   mockDeleteFile.mockResolvedValue(undefined)
   mockRemovePageEmbedding.mockResolvedValue(undefined)
   mockWriteFile.mockResolvedValue(undefined)
+  mockLoadReviewItems.mockResolvedValue([])
+  mockSaveReviewItems.mockResolvedValue(undefined)
 })
 
 describe("cascadeDeleteWikiPage", () => {
@@ -47,7 +59,7 @@ describe("cascadeDeleteWikiPage", () => {
     expect(mockDeleteFile).toHaveBeenCalledWith("/proj/wiki/concepts/rope.md")
 
     expect(mockRemovePageEmbedding).toHaveBeenCalledTimes(1)
-    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("/proj", "rope")
+    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("/proj", "concepts/rope")
   })
 
   it("calls deleteFile BEFORE removePageEmbedding (file is the source of truth)", async () => {
@@ -95,9 +107,9 @@ describe("cascadeDeleteWikiPage", () => {
     expect(mockDeleteFile).toHaveBeenCalled()
   })
 
-  it("derives slug from the path's basename, ignoring directory segments", async () => {
+  it("qualifies the page id with its wiki-relative directory", async () => {
     await cascadeDeleteWikiPage("/proj", "/proj/wiki/concepts/some-deep/nested/page.md")
-    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("/proj", "page")
+    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("/proj", "concepts/some-deep/nested/page")
   })
 
   it("handles Windows backslash paths (project path normalization happens elsewhere)", async () => {
@@ -107,7 +119,7 @@ describe("cascadeDeleteWikiPage", () => {
     await cascadeDeleteWikiPage("C:/proj", "C:\\proj\\wiki\\entities\\transformer.md")
 
     expect(mockDeleteFile).toHaveBeenCalledWith("C:\\proj\\wiki\\entities\\transformer.md")
-    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("C:/proj", "transformer")
+    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("C:/proj", "entities/transformer")
   })
 
   it("preserves dotted page names (e.g. foo.bar.md) in the slug", async () => {
@@ -115,7 +127,7 @@ describe("cascadeDeleteWikiPage", () => {
     // Pin it: a regression that strips ALL dots would turn this slug
     // into "foo" and orphan the LanceDB chunks for "foo.bar".
     await cascadeDeleteWikiPage("/proj", "/proj/wiki/concepts/foo.bar.md")
-    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("/proj", "foo.bar")
+    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("/proj", "concepts/foo.bar")
   })
 
   it("skips removePageEmbedding when slug derivation yields empty (defensive)", async () => {
@@ -144,7 +156,7 @@ describe("cascadeDeleteWikiPage", () => {
     expect(mockDeleteFile).toHaveBeenCalledTimes(2)
     expect(mockDeleteFile).toHaveBeenNthCalledWith(1, "/proj/wiki/sources/rope-paper.md")
     expect(mockDeleteFile).toHaveBeenNthCalledWith(2, "/proj/wiki/media/rope-paper")
-    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("/proj", "rope-paper")
+    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("/proj", "sources/rope-paper")
   })
 
   it("does NOT cascade media when deleting a non-source page (concept / entity / queries)", async () => {
@@ -179,7 +191,7 @@ describe("cascadeDeleteWikiPage", () => {
     // Both attempts happened.
     expect(mockDeleteFile).toHaveBeenCalledTimes(2)
     // Embedding cascade still ran in between.
-    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("/proj", "text-only-source")
+    expect(mockRemovePageEmbedding).toHaveBeenCalledWith("/proj", "sources/text-only-source")
   })
 
   it("handles Windows backslash paths in the source-page detection", async () => {
@@ -259,7 +271,7 @@ describe("cascadeDeleteWikiPagesWithRefs", () => {
     const result = await cascadeDeleteWikiPagesWithRefs(PROJECT, [target])
     expect(result.deletedPaths).toEqual([target])
     expect(mockDeleteFile).toHaveBeenCalledWith(target)
-    expect(mockRemovePageEmbedding).toHaveBeenCalledWith(PROJECT, "alice-chen")
+    expect(mockRemovePageEmbedding).toHaveBeenCalledWith(PROJECT, "entities/alice-chen")
   })
 
   it("strips [[deleted]] body wikilinks from sibling pages", async () => {
@@ -477,5 +489,42 @@ describe("cascadeDeleteWikiPagesWithRefs", () => {
     )!
     expect(bobWrite[1]).not.toContain("[[alice-chen]]")
     expect(bobWrite[1]).not.toContain("[[alice-chen-1]]")
+  })
+
+  it("removes deleted affected pages and drops reviews that become orphaned", async () => {
+    const target = `${PROJECT}/wiki/entities/a.md`
+    mockReadFile.mockImplementation(async (path: string) => {
+      if (path === target) return "---\ntitle: A\n---\n"
+      throw new Error(`unexpected read ${path}`)
+    })
+    mockListDirectory.mockResolvedValueOnce([])
+    mockLoadReviewItems.mockResolvedValueOnce([
+      { id: "orphan", affectedPages: ["entities/a.md"] },
+      { id: "survivor", affectedPages: ["entities/a.md", "entities/b.md"] },
+      { id: "general" },
+    ])
+
+    await cascadeDeleteWikiPagesWithRefs(PROJECT, [target])
+
+    expect(mockSaveReviewItems).toHaveBeenCalledWith(PROJECT, [
+      { id: "survivor", affectedPages: ["entities/b.md"] },
+      { id: "general" },
+    ])
+  })
+
+  it("preserves case-distinct review paths on case-sensitive project paths", async () => {
+    const target = `${PROJECT}/wiki/entities/Foo.md`
+    mockReadFile.mockImplementation(async (path: string) => {
+      if (path === target) return "---\ntitle: Foo\n---\n"
+      throw new Error(`unexpected read ${path}`)
+    })
+    mockListDirectory.mockResolvedValueOnce([])
+    mockLoadReviewItems.mockResolvedValueOnce([
+      { id: "lowercase", affectedPages: ["entities/foo.md"] },
+    ])
+
+    await cascadeDeleteWikiPagesWithRefs(PROJECT, [target])
+
+    expect(mockSaveReviewItems).not.toHaveBeenCalled()
   })
 })

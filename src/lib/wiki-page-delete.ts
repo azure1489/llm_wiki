@@ -21,7 +21,7 @@
  */
 import { deleteFile, listDirectory, readFile, writeFile } from "@/commands/fs"
 import { getFileStem, normalizePath } from "@/lib/path-utils"
-import { removePageEmbedding } from "@/lib/embedding"
+import { removePageEmbedding, wikiPageIdFromPath } from "@/lib/embedding"
 import {
   buildDeletedKeys,
   cleanIndexListing,
@@ -35,6 +35,8 @@ import {
   writeFrontmatterArray,
 } from "@/lib/sources-merge"
 import type { FileNode } from "@/types/wiki"
+import { loadReviewItems, saveReviewItems } from "@/lib/persist"
+import { useReviewStore } from "@/stores/review-store"
 
 /**
  * Detect whether a wiki page lives under `wiki/sources/`. We treat
@@ -61,10 +63,9 @@ function isSourcePage(pagePath: string): boolean {
  * cascade to the right LanceDB instance, and to locate the media
  * directory).
  *
- * `pagePath` may be absolute or relative; only its basename is used
- * for the page-id lookup, so callers don't need to normalize before
- * calling. The disk delete uses the path verbatim — pass an
- * absolute path if your caller has one (most do).
+ * `pagePath` may be absolute or project-relative. Its wiki-relative path is
+ * used as the vector identity so same-named pages in different schema
+ * directories remain independent.
  */
 export async function cascadeDeleteWikiPage(
   projectPath: string,
@@ -72,8 +73,9 @@ export async function cascadeDeleteWikiPage(
 ): Promise<void> {
   await deleteFile(pagePath)
   const slug = getFileStem(pagePath)
-  if (slug.length > 0) {
-    await removePageEmbedding(projectPath, slug)
+  const pageId = wikiPageIdFromPath(projectPath, pagePath)
+  if (pageId.length > 0) {
+    await removePageEmbedding(projectPath, pageId)
   }
 
   // Media cascade: source-summary deletion → drop the source's
@@ -126,6 +128,45 @@ export interface CascadeDeleteResult {
   deletedPaths: string[]
   /** How many surviving wiki files we rewrote to drop stale refs. */
   rewrittenFiles: number
+}
+
+async function pruneDeletedPagesFromReviews(
+  projectPath: string,
+  deletedPaths: readonly string[],
+): Promise<void> {
+  const pathKey = (path: string) => {
+    const normalized = normalizePath(path)
+    return /^[A-Za-z]:\//.test(normalized) || normalized.startsWith("//")
+      ? normalized.toLowerCase()
+      : normalized
+  }
+  const projectKey = pathKey(projectPath)
+  const deleted = new Set(deletedPaths.map(pathKey))
+  const toAbsolute = (path: string) => {
+    const normalized = normalizePath(path)
+    if (pathKey(normalized).startsWith(`${projectKey}/`)) return pathKey(normalized)
+    const relative = normalized.replace(/^wiki\//i, "")
+    return pathKey(`${projectPath}/wiki/${relative}`)
+  }
+  try {
+    const reviews = await loadReviewItems(projectPath)
+    let changed = false
+    const remaining = reviews.flatMap((item) => {
+      if (!item.affectedPages?.length) return [item]
+      const affectedPages = item.affectedPages.filter((path) => !deleted.has(toAbsolute(path)))
+      if (affectedPages.length === item.affectedPages.length) return [item]
+      changed = true
+      return affectedPages.length > 0 ? [{ ...item, affectedPages }] : []
+    })
+    if (!changed) return
+    await saveReviewItems(projectPath, remaining)
+    const activeProject = (await import("@/stores/wiki-store")).useWikiStore.getState().project
+    if (activeProject && pathKey(activeProject.path) === projectKey) {
+      useReviewStore.getState().setItems(remaining)
+    }
+  } catch (err) {
+    console.warn("[wiki-delete] failed to prune orphaned reviews:", err)
+  }
 }
 
 /**
@@ -240,6 +281,8 @@ export async function cascadeDeleteWikiPagesWithRefs(
       }
     }
   }
+
+  await pruneDeletedPagesFromReviews(pp, result.deletedPaths)
 
   return result
 }

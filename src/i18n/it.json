@@ -5,7 +5,7 @@
   },
   "common": {
     "retry": "Riprova", "cancel": "Annulla", "ignore": "Ignora", "close": "Chiudi", "ok": "OK", "confirm": "Conferma", "notice": "Avviso",
-    "dismiss": "Nascondi", "loading": "Caricamento...", "optional": "opzionale"
+    "dismiss": "Nascondi", "remove": "Rimuovi", "loading": "Caricamento...", "optional": "opzionale"
   },
   "layout": { "showSidebar": "Mostra la barra laterale", "hideSidebar": "Nascondi la barra laterale" },
   "errors": { "generic": "Qualcosa è andato storto" },
@@ -586,6 +586,9 @@
         "streamingOutputOff": "Streaming disattivo: il testo della risposta compare al termine della generazione.",
         "customHeaders": "Header personalizzati",
         "customHeadersHint": "Opzionale. Inserisci un Nome-Header: valore per riga. Content-Type e gli header configurati per la chiave API hanno la precedenza.",
+        "extraRequestBody": "Corpo richiesta aggiuntivo (JSON)",
+        "extraRequestBodyHint": "Campi opzionali per API personalizzate compatibili con OpenAI, ad esempio enable_thinking. Messaggi, modello e streaming non possono essere sovrascritti.",
+        "extraRequestBodyInvalid": "Inserisci un oggetto JSON valido prima di uscire dal campo.",
         "cliStatus": "Stato della CLI",
         "checkingCli": "Controllo…",
         "recheckCli": "Ricontrolla",
@@ -646,7 +649,7 @@
         "overlapChunkChars": "Sovrapposizione (caratteri)",
         "overlapChunkCharsHint": "Caratteri di sovrapposizione tra chunk adiacenti, così i concetti non vengono spezzati ai bordi.",
         "concurrency": "Richieste in parallelo",
-        "concurrencyHint": "Numero massimo di richieste di embedding contemporanee (1–32). Aumentalo gradualmente in base alla capacità del tuo endpoint.",
+        "concurrencyHint": "Numero massimo di richieste di embedding contemporanee (1–64). Aumentalo gradualmente in base alla capacità del tuo endpoint.",
         "batchSize": "Input per richiesta",
         "batchSizeHint": "Solo endpoint compatibili OpenAI (1–64). I provider non supportati usano automaticamente richieste a input singolo.",
         "providerTests": "Test del provider",
@@ -764,6 +767,8 @@
         "description": "Controlla raw/sources per intercettare modifiche esterne e scegli quali file possono entrare nell'elaborazione automatica.",
         "enable": "Monitora la cartella fonti del progetto",
         "enableDescription": "Aggiorna la vista Fonti e indicizza i file consentiti nuovi o modificati sotto raw/sources.",
+        "allProjects": "Monitora tutti i progetti recenti",
+        "allProjectsDescription": "Controlla le cartelle delle fonti di tutti i progetti recenti con il monitoraggio attivo. Le modifiche in background vengono accodate nel progetto corrispondente ed eseguite quando viene aperto.",
         "autoIngest": "Elabora automaticamente i file sorgente consentiti",
         "autoIngestDescription": "Se disattivo, le modifiche esterne aggiornano comunque l'albero dei file ma non creano attività di elaborazione.",
         "persistExtractedMarkdown": "Conserva il Markdown estratto",
@@ -1027,6 +1032,8 @@
     }
   },
   "preview": {
+    "back": "Indietro",
+    "forward": "Avanti",
     "selectFile": "Seleziona un file da visualizzare",
     "notAvailable": "Anteprima non disponibile per questo tipo di file",
     "viewAsText": "Visualizza come testo",
@@ -1063,6 +1070,7 @@
     "cancelAll": "Annulla tutto",
     "cancelAllTitle": "Annulla tutte le attività in coda e in corso",
     "cancelAllConfirm": "Annullare tutte le {{count}} attività di elaborazione in coda o in corso? I file parziali dell'attività in corso verranno rimossi. Le attività annullate restano in coda, così puoi riavviarle.",
+    "removeSelectedConfirm": "Rimuovere definitivamente dalla coda le attività di elaborazione interrotte selezionate? Selezione: {{count}}. L\u0027operazione non può essere annullata.",
     "retryFailed": "Riavvia le interrotte",
     "retryFailedTitle": "Riavvia tutte le attività di elaborazione non riuscite e annullate",
     "selectAll": "Seleziona tutto",
@@ -1139,6 +1147,7 @@
     "communitiesLabel": "Comunità",
     "showAll": "Mostra tutto",
     "cluster": "Cluster {{id}}",
+    "lowInternalConnectivity": "Connettività interna bassa: {{count}} link per pagina",
     "surprisingConnections": "Connessioni inaspettate",
     "knowledgeGaps": "Lacune di conoscenza",
     "deepResearch": "Deep Research",

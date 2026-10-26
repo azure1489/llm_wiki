@@ -5,7 +5,7 @@
   },
   "common": {
     "retry": "Retry", "cancel": "Cancel", "ignore": "Ignore", "close": "Close", "ok": "OK", "confirm": "Confirm", "notice": "Notice",
-    "dismiss": "Dismiss", "loading": "Loading...", "optional": "optional"
+    "dismiss": "Dismiss", "remove": "Remove", "loading": "Loading...", "optional": "optional"
   },
   "layout": { "showSidebar": "Show sidebar", "hideSidebar": "Hide sidebar" },
   "errors": { "generic": "Something went wrong" },
@@ -586,6 +586,9 @@
         "streamingOutputOff": "Streaming off: response text appears after generation completes.",
         "customHeaders": "Custom request headers",
         "customHeadersHint": "Optional. Enter one Header-Name: value per line. Content-Type and configured API-key headers take precedence.",
+        "extraRequestBody": "Extra request body (JSON)",
+        "extraRequestBodyHint": "Optional fields for custom OpenAI-compatible APIs, such as enable_thinking. Core messages, model, and streaming fields cannot be overridden.",
+        "extraRequestBodyInvalid": "Enter a valid JSON object before leaving this field.",
         "cliStatus": "CLI status",
         "checkingCli": "Checking…",
         "recheckCli": "Re-check",
@@ -646,7 +649,7 @@
         "overlapChunkChars": "Overlap (characters)",
         "overlapChunkCharsHint": "Characters of overlap between adjacent chunks so ideas aren't severed at boundaries.",
         "concurrency": "Concurrent requests",
-        "concurrencyHint": "Maximum embedding requests in flight (1–32). Increase gradually according to your endpoint's capacity.",
+        "concurrencyHint": "Maximum embedding requests in flight (1–64). Increase gradually according to your endpoint's capacity.",
         "batchSize": "Inputs per request",
         "batchSizeHint": "OpenAI-compatible endpoints only (1–64). Unsupported providers automatically use single-input requests.",
         "providerTests": "Provider tests",
@@ -764,6 +767,8 @@
         "description": "Monitor raw/sources for external changes and choose which files are allowed into automatic ingest.",
         "enable": "Monitor project source folder",
         "enableDescription": "Refreshes the Sources view and indexes allowed new or modified files under raw/sources.",
+        "allProjects": "Monitor all recent projects",
+        "allProjectsDescription": "Keep watching source folders for every recent project that has monitoring enabled. Background changes are queued for that project and run when it is opened.",
         "autoIngest": "Auto-ingest allowed source files",
         "autoIngestDescription": "When disabled, external changes still refresh the file tree but do not create ingest tasks.",
         "persistExtractedMarkdown": "Keep parsed Markdown",
@@ -1027,6 +1032,8 @@
     }
   },
   "preview": {
+    "back": "Back",
+    "forward": "Forward",
     "selectFile": "Select a file to preview",
     "notAvailable": "Preview not available for this file type",
     "viewAsText": "View as text",
@@ -1063,6 +1070,7 @@
     "cancelAll": "Cancel all",
     "cancelAllTitle": "Cancel all queued and in-progress tasks",
     "cancelAllConfirm": "Cancel all {{count}} queued/processing ingest tasks? Partial files from the in-progress task will be removed. Cancelled tasks stay in the queue so you can restart them.",
+    "removeSelectedConfirm": "Permanently remove the selected stopped ingest tasks from the queue? Selected: {{count}}. Removal cannot be undone.",
     "retryFailed": "Restart stopped",
     "retryFailedTitle": "Restart all failed and cancelled ingest tasks",
     "selectAll": "Select all",
@@ -1139,6 +1147,7 @@
     "communitiesLabel": "Communities",
     "showAll": "Show all",
     "cluster": "Cluster {{id}}",
+    "lowInternalConnectivity": "Low internal connectivity: {{count}} links per page",
     "surprisingConnections": "Surprising Connections",
     "knowledgeGaps": "Knowledge Gaps",
     "deepResearch": "Deep Research",

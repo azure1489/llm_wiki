@@ -5,7 +5,7 @@
   },
   "common": {
     "retry": "重试", "cancel": "取消", "ignore": "忽略", "close": "关闭", "ok": "确定", "confirm": "确认", "notice": "提示",
-    "dismiss": "关闭", "loading": "加载中……", "optional": "可选"
+    "dismiss": "关闭", "remove": "移除", "loading": "加载中……", "optional": "可选"
   },
   "layout": { "showSidebar": "展开侧栏", "hideSidebar": "收起侧栏" },
   "errors": { "generic": "出现错误" },
@@ -586,6 +586,9 @@
         "streamingOutputOff": "流式输出已关闭：生成完成后一次性显示内容。",
         "customHeaders": "自定义请求头",
         "customHeadersHint": "可选。每行填写一条 Header-Name: value。Content-Type 和已配置的 API 密钥请求头优先。",
+        "extraRequestBody": "额外请求体（JSON）",
+        "extraRequestBodyHint": "用于自定义 OpenAI 兼容 API 的可选字段，例如 enable_thinking。不能覆盖消息、模型和流式输出等核心字段。",
+        "extraRequestBodyInvalid": "请输入有效的 JSON 对象后再离开此输入框。",
         "cliStatus": "CLI 状态",
         "checkingCli": "正在检查……",
         "recheckCli": "重新检查",
@@ -646,7 +649,7 @@
         "overlapChunkChars": "重叠字符数",
         "overlapChunkCharsHint": "相邻 chunk 之间的重叠字符数，避免语义在边界被切断。",
         "concurrency": "并发请求数",
-        "concurrencyHint": "同时进行的 embedding 请求上限（1–32）。请根据 endpoint 承载能力逐步调高。",
+        "concurrencyHint": "同时进行的 embedding 请求上限（1–64）。请根据 endpoint 承载能力逐步调高。",
         "batchSize": "单次请求输入数",
         "batchSizeHint": "仅 OpenAI 兼容 endpoint 支持（1–64）；不支持的 Provider 会自动使用单条请求。",
         "providerTests": "Provider 测试",
@@ -764,6 +767,8 @@
         "description": "监控 raw/sources 的外部变化，并选择哪些文件允许自动进入提取队列。",
         "enable": "监控项目资料文件夹",
         "enableDescription": "刷新原始资料列表，并为 raw/sources 下允许的新文件或修改文件建立提取任务。",
+        "allProjects": "监控所有最近项目",
+        "allProjectsDescription": "持续检查最近项目列表中所有已启用资料监控的项目。后台发现的变化会写入对应项目的队列，并在打开该项目后执行。",
         "autoIngest": "自动提取允许的原始资料文件",
         "autoIngestDescription": "关闭后，外部变化仍会刷新文件树，但不会创建提取任务。",
         "persistExtractedMarkdown": "保留解析后的 Markdown",
@@ -1027,6 +1032,8 @@
     }
   },
   "preview": {
+    "back": "后退",
+    "forward": "前进",
     "selectFile": "选择文件以预览",
     "notAvailable": "该文件类型暂不支持预览",
     "viewAsText": "作为文本查看",
@@ -1063,6 +1070,7 @@
     "cancelAll": "全部取消",
     "cancelAllTitle": "取消所有排队和正在处理的任务",
     "cancelAllConfirm": "要取消全部 {{count}} 个排队/处理中摄取任务吗？正在处理任务产生的部分文件会被移除；已取消任务会保留在队列中，之后可以重新启动。",
+    "removeSelectedConfirm": "要将选中的已停止摄取任务从队列中永久移除吗？已选择：{{count}}。移除后无法重新启动。",
     "retryFailed": "重启已停止任务",
     "retryFailedTitle": "重新启动所有失败和已取消的摄取任务",
     "selectAll": "全选",
@@ -1139,6 +1147,7 @@
     "communitiesLabel": "社区",
     "showAll": "显示全部",
     "cluster": "簇 {{id}}",
+    "lowInternalConnectivity": "内部连接较少：平均每页 {{count}} 条链接",
     "surprisingConnections": "意外连接",
     "knowledgeGaps": "知识缺口",
     "deepResearch": "深度研究",
